@@ -13,6 +13,7 @@ use futures::TryStreamExt;
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::{path::PathBuf, sync::Arc};
+use sha2::{Digest, Sha256};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
@@ -209,6 +210,7 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
     let mut password: Option<String> = None;
     let mut file_meta: Option<(String, Option<String>)> = None;
     let mut tmp_path: Option<PathBuf> = None;
+    let mut content_hash: Option<String> = None;
     let mut size: i64 = 0;
 
     while let Ok(Some(mut field)) = mp.next_field().await {
@@ -222,8 +224,10 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
                     Ok(f) => f,
                     Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("create tmp: {e}")),
                 };
+                let mut hasher = Sha256::new();
                 while let Ok(Some(chunk)) = field.try_next().await {
                     size += chunk.len() as i64;
+                    hasher.update(&chunk);
                     if let Err(e) = f.write_all(&chunk).await {
                         let _ = tokio::fs::remove_file(&tmp).await;
                         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"));
@@ -235,6 +239,7 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
                 }
                 tmp_path = Some(tmp);
                 file_meta = Some((original_name, content_type));
+                content_hash = Some(hex::encode(hasher.finalize()));
             }
             _ => {}
         }
@@ -249,6 +254,10 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
         return err(StatusCode::BAD_REQUEST, "missing file".into());
     };
     let Some(tmp) = tmp_path else {
+        return err(StatusCode::BAD_REQUEST, "missing file".into());
+    };
+    let Some(content_hash) = content_hash else {
+        let _ = tokio::fs::remove_file(&tmp).await;
         return err(StatusCode::BAD_REQUEST, "missing file".into());
     };
 
@@ -272,16 +281,23 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
         }
     };
 
-    let final_path = st.cfg.files_dir().join(&code);
-    if let Err(e) = tokio::fs::rename(&tmp, &final_path).await {
+    // Content-addressed storage: path is derived from the hash, so identical
+    // content always lands at the same path and dedup is a filesystem property.
+    let final_path = st.cfg.files_dir().join(&content_hash);
+    let fresh_file = !tokio::fs::try_exists(&final_path).await.unwrap_or(false);
+    if fresh_file {
+        if let Err(e) = tokio::fs::rename(&tmp, &final_path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}"));
+        }
+    } else {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}"));
     }
-
     let stored_path = final_path.to_string_lossy().to_string();
+
     let insert = sqlx::query(
-        "INSERT INTO files (link_id, original_name, stored_path, content_type, size_bytes, uploaded_by, created_by_label)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        "INSERT INTO files (link_id, original_name, stored_path, content_type, size_bytes, uploaded_by, created_by_label, content_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
     )
     .bind(link_id)
     .bind(&original_name)
@@ -290,10 +306,13 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
     .bind(size)
     .bind(pw_id)
     .bind(&pw_label)
+    .bind(&content_hash)
     .execute(&st.pool)
     .await;
     if let Err(e) = insert {
-        let _ = tokio::fs::remove_file(&final_path).await;
+        if fresh_file {
+            let _ = tokio::fs::remove_file(&final_path).await;
+        }
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db insert: {e}"));
     }
 
