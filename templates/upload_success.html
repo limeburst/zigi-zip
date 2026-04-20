@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+{% block extra_css %}
+.qr { display: block; margin: 1rem 0; width: 220px; height: 220px; }
+.qr svg { width: 100%; height: 100%; }
+{% endblock %}
+{% block body %}
+<p>uploaded: <a href="{{ url }}">{{ url }}</a></p>
+<div class="qr">{{ qr_svg | safe }}</div>
+<p><a href="/upload">upload another</a></p>
+{% endblock %}

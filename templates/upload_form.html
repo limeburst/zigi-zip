@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+{% block body %}
+<h1>zigi.zip</h1>
+<p class="hint">upload a file, get a short link.</p>
+<form method="post" action="/upload" enctype="multipart/form-data">
+  <input type="password" name="password" placeholder="password" required autocomplete="current-password">
+  <input type="file" name="file" required>
+  <button type="submit">upload</button>
+</form>
+{% endblock %}

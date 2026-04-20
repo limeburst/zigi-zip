@@ -1,0 +1,9 @@
+{% extends "layout.html" %}
+{% block body %}
+<h1>zigi.zip · new paste</h1>
+<p class="hint">live collaborative editor. password to create; anyone with the link can edit.</p>
+<form method="post" action="/code">
+  <input type="password" name="password" placeholder="password" required autocomplete="current-password">
+  <button type="submit">create</button>
+</form>
+{% endblock %}

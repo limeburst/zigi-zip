@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zigi.zip · {{ code }}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+{{ base_css | safe }}
+html, body { margin: 0; height: 100%; max-width: none; padding: 0; }
+body { display: flex; flex-direction: column; }
+#bar {
+  display: flex; align-items: center; gap: 1rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+  font-size: 0.85rem;
+}
+#bar .spacer { flex: 1; }
+#status, #lang { opacity: 0.7; }
+a.code { text-decoration: none; font-weight: 600; }
+#editor { flex: 1; min-height: 0; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <a class="code" href="{{ url }}">{{ code }}</a>
+  <div class="spacer"></div>
+  <span id="lang">detecting…</span>
+  <span id="status">connecting…</span>
+</div>
+<div id="editor"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js"></script>
+<!-- y-websocket and y-monaco are served with ?external=yjs, so their internal
+     `import 'yjs'` is a bare specifier. This import map resolves it to the
+     single shared copy — fixing Yjs's "already imported" sanity warning. -->
+<script type="importmap">
+{
+  "imports": {
+    "yjs": "https://esm.sh/yjs@13.6.18"
+  }
+}
+</script>
+<script type="module">
+  const code = {{ code_json | safe }};
+  const statusEl = document.getElementById('status');
+  const langEl = document.getElementById('lang');
+
+  function setStatus(s) { statusEl.textContent = s; }
+
+  // Core editor: Monaco + Yjs + y-websocket. Anything below this must keep the
+  // editor working even if it fails.
+  // esm.sh honors ?external=yjs so y-websocket and y-monaco share the single
+  // Yjs instance we load here (jsdelivr's +esm bundles a separate copy per dep,
+  // which trips Yjs's "already imported" sanity check).
+  let Y, WebsocketProvider, MonacoBinding;
+  try {
+    [Y, { WebsocketProvider }, { MonacoBinding }] = await Promise.all([
+      import('https://esm.sh/yjs@13.6.18'),
+      import('https://esm.sh/y-websocket@2.0.4?external=yjs'),
+      import('https://esm.sh/y-monaco@0.1.6?external=yjs'),
+    ]);
+  } catch (e) {
+    setStatus('failed to load editor modules');
+    console.error(e);
+    throw e;
+  }
+
+  const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsScheme}//${location.host}`;
+
+  window.require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs' } });
+  window.require(['vs/editor/editor.main'], async () => {
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText('monaco');
+
+    const provider = new WebsocketProvider(wsUrl, code + '/ws', ydoc, { connect: true });
+    provider.on('status', (ev) => setStatus(ev.status || ev));
+    provider.on('connection-error', (e) => { setStatus('error'); console.error('ws error', e); });
+    provider.on('connection-close', () => setStatus('disconnected'));
+    provider.ws && (provider.ws.onerror = (e) => console.error('ws onerror', e));
+
+    const editor = monaco.editor.create(document.getElementById('editor'), {
+      value: '',
+      language: 'plaintext',
+      theme: matchMedia('(prefers-color-scheme: dark)').matches ? 'vs-dark' : 'vs',
+      automaticLayout: true,
+      minimap: { enabled: false },
+      fontSize: 13,
+    });
+
+    const model = editor.getModel();
+    new MonacoBinding(ytext, model, new Set([editor]), provider.awareness);
+
+    // Language detection loads lazily; if it fails, editor still works.
+    const langMap = {
+      js: 'javascript', ts: 'typescript', jsx: 'javascript', tsx: 'typescript',
+      py: 'python', rb: 'ruby', rs: 'rust', go: 'go', java: 'java', kt: 'kotlin',
+      cs: 'csharp', cpp: 'cpp', c: 'c', h: 'cpp', hpp: 'cpp', sh: 'shell', bat: 'bat',
+      ps1: 'powershell', sql: 'sql', yaml: 'yaml', yml: 'yaml', toml: 'ini', ini: 'ini',
+      json: 'json', xml: 'xml', html: 'html', css: 'css', scss: 'scss', md: 'markdown',
+      php: 'php', swift: 'swift', r: 'r', lua: 'lua', pl: 'perl', hs: 'haskell',
+      scala: 'scala', clj: 'clojure', dart: 'dart', ex: 'elixir', erl: 'erlang',
+      jl: 'julia', dockerfile: 'dockerfile',
+    };
+    let detector = null;
+    try {
+      // esm.sh exposes ModelOperations as a named export.
+      const ld = await import('https://esm.sh/@vscode/vscode-languagedetection@1.0.22');
+      const ModelOperations = ld.ModelOperations || (ld.default && ld.default.ModelOperations) || ld.default;
+      if (typeof ModelOperations !== 'function') throw new Error('ModelOperations not found on module');
+      detector = new ModelOperations({
+        modelJsonLoaderFunc: async () => (await fetch('https://cdn.jsdelivr.net/npm/@vscode/vscode-languagedetection@1.0.22/model/model.json')).json(),
+        weightsLoaderFunc: async () => (await fetch('https://cdn.jsdelivr.net/npm/@vscode/vscode-languagedetection@1.0.22/model/group1-shard1of1.bin')).arrayBuffer(),
+      });
+      langEl.textContent = 'plaintext';
+    } catch (e) {
+      console.warn('language detection unavailable', e);
+      langEl.textContent = 'plaintext';
+    }
+
+    let detectTimer = 0;
+    function scheduleDetect() {
+      if (!detector) return;
+      clearTimeout(detectTimer);
+      detectTimer = setTimeout(async () => {
+        const text = model.getValue();
+        if (text.length < 10) { langEl.textContent = 'plaintext'; return; }
+        try {
+          const res = await detector.runModel(text);
+          if (res && res.length) {
+            const top = res[0];
+            const mapped = langMap[top.languageId] || top.languageId;
+            const available = monaco.languages.getLanguages().some(l => l.id === mapped);
+            const pick = available ? mapped : 'plaintext';
+            monaco.editor.setModelLanguage(model, pick);
+            langEl.textContent = `${pick} (${(top.confidence * 100).toFixed(0)}%)`;
+          }
+        } catch (e) {
+          console.warn('detect failed', e);
+        }
+      }, 600);
+    }
+    ytext.observe(scheduleDetect);
+    scheduleDetect();
+  });
+</script>
+</body>
+</html>
