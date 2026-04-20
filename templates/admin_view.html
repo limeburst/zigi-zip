@@ -1,8 +1,10 @@
 {% extends "layout.html" %}
 {% block extra_css %}
+body { max-width: min(1200px, 96vw); }
 h2 { margin-top: 2rem; }
-table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
-th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; vertical-align: top; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; table-layout: auto; }
+th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; vertical-align: top; white-space: nowrap; }
+td.filename { white-space: normal; word-break: break-all; }
 th { font-weight: 600; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -23,7 +25,7 @@ form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
   {% for f in files %}
     <tr>
       <td class="mono"><a href="/{{ f.code }}">{{ f.code }}</a></td>
-      <td>{{ f.original_name }}</td>
+      <td class="filename">{{ f.original_name }}</td>
       <td class="num">{{ f.size_bytes }}</td>
       <td>{{ f.uploaded_at }}</td>
       <td>{{ f.created_by_label }}</td>
