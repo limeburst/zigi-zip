@@ -39,7 +39,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
     let app = Router::new()
         .route("/", get(root))
         .route(
-            "/upload",
+            "/file",
             get(upload_form).post(upload).layer(DefaultBodyLimit::disable()),
         )
         .route("/code", get(paste_form).post(create_paste))
