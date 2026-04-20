@@ -6,15 +6,19 @@ th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #ee
 th { font-weight: 600; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+form.inline { display: inline; margin: 0; padding: 0; border: 0; }
+form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
+.flash { padding: 0.4rem 0.6rem; border: 1px solid currentColor; margin: 0.5rem 0; }
 {% endblock %}
 {% block body %}
 <h1>zigi.zip · admin</h1>
 <p class="hint">signed in as <strong>{{ admin_label }}</strong></p>
+{% if flash %}<p class="flash">{{ flash }}</p>{% endif %}
 
 <h2>files ({{ files | length }})</h2>
 {% if files %}
 <table>
-  <thead><tr><th>code</th><th>filename</th><th>size</th><th>uploaded</th><th>by</th></tr></thead>
+  <thead><tr><th>code</th><th>filename</th><th>size</th><th>uploaded</th><th>by</th><th></th></tr></thead>
   <tbody>
   {% for f in files %}
     <tr>
@@ -23,6 +27,13 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
       <td class="num">{{ f.size_bytes }}</td>
       <td>{{ f.uploaded_at }}</td>
       <td>{{ f.created_by_label }}</td>
+      <td>
+        <form class="inline" method="post" action="/admin/delete" onsubmit="return confirm('delete {{ f.code }}?')">
+          <input type="hidden" name="password" value="{{ password }}">
+          <input type="hidden" name="code" value="{{ f.code }}">
+          <button type="submit">delete</button>
+        </form>
+      </td>
     </tr>
   {% endfor %}
   </tbody>
@@ -32,13 +43,20 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <h2>notes ({{ pastes | length }})</h2>
 {% if pastes %}
 <table>
-  <thead><tr><th>code</th><th>updated</th><th>by</th></tr></thead>
+  <thead><tr><th>code</th><th>updated</th><th>by</th><th></th></tr></thead>
   <tbody>
   {% for p in pastes %}
     <tr>
       <td class="mono"><a href="/{{ p.code }}">{{ p.code }}</a></td>
       <td>{{ p.updated_at }}</td>
       <td>{{ p.created_by_label }}</td>
+      <td>
+        <form class="inline" method="post" action="/admin/delete" onsubmit="return confirm('delete {{ p.code }}?')">
+          <input type="hidden" name="password" value="{{ password }}">
+          <input type="hidden" name="code" value="{{ p.code }}">
+          <button type="submit">delete</button>
+        </form>
+      </td>
     </tr>
   {% endfor %}
   </tbody>

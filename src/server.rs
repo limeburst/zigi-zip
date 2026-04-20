@@ -44,6 +44,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         )
         .route("/code", get(paste_form).post(create_paste))
         .route("/admin", get(admin_login).post(admin_view))
+        .route("/admin/delete", axum::routing::post(admin_delete))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
         .route("/:code/:rest", get(dispatch_code_with_rest))
@@ -86,8 +87,8 @@ struct AdminForm {
 }
 
 async fn admin_view(State(st): State<AppState>, Form(form): Form<AdminForm>) -> Response {
-    let (_, admin_label) = match passwd::verify_admin(&st.pool, &form.password).await {
-        Ok(Some(v)) => v,
+    let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some((_, l))) => l,
         Ok(None) => {
             return Html(templates::render(
                 "admin_login.html",
@@ -97,7 +98,71 @@ async fn admin_view(State(st): State<AppState>, Form(form): Form<AdminForm>) -> 
         }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
+    render_admin(&st, &form.password, &admin_label, None).await
+}
 
+#[derive(Deserialize)]
+struct AdminDeleteForm {
+    password: String,
+    code: String,
+}
+
+async fn admin_delete(State(st): State<AppState>, Form(form): Form<AdminDeleteForm>) -> Response {
+    let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some((_, l))) => l,
+        Ok(None) => {
+            return Html(templates::render(
+                "admin_login.html",
+                context! { title => "zigi.zip · admin", error => "invalid admin password" },
+            ))
+            .into_response();
+        }
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let msg = match delete_link(&st, &form.code).await {
+        Ok(m) => m,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}")),
+    };
+    render_admin(&st, &form.password, &admin_label, Some(msg)).await
+}
+
+/// Delete the link with `code` and — for file links — remove the on-disk
+/// blob only when no other links still reference that `stored_path`.
+async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
+    let link: Option<(i64, String)> =
+        sqlx::query_as("SELECT id, kind FROM links WHERE short_code = $1")
+            .bind(code)
+            .fetch_optional(&st.pool)
+            .await?;
+    let Some((link_id, kind)) = link else {
+        return Ok(format!("{code}: not found"));
+    };
+    let stored_path: Option<String> = if kind == links::KIND_FILE {
+        sqlx::query_scalar("SELECT stored_path FROM files WHERE link_id = $1")
+            .bind(link_id)
+            .fetch_optional(&st.pool)
+            .await?
+    } else {
+        None
+    };
+    sqlx::query("DELETE FROM links WHERE id = $1")
+        .bind(link_id)
+        .execute(&st.pool)
+        .await?;
+    if let Some(sp) = stored_path {
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE stored_path = $1")
+                .bind(&sp)
+                .fetch_one(&st.pool)
+                .await?;
+        if remaining == 0 {
+            let _ = tokio::fs::remove_file(&sp).await;
+        }
+    }
+    Ok(format!("deleted {code}"))
+}
+
+async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: Option<String>) -> Response {
     let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>, String)> = match sqlx::query_as(
         "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at, f.created_by_label
          FROM files f JOIN links l ON l.id = f.link_id
@@ -145,6 +210,8 @@ async fn admin_view(State(st): State<AppState>, Form(form): Form<AdminForm>) -> 
         context! {
             title => "zigi.zip · admin",
             admin_label => admin_label,
+            password => password,
+            flash => flash.unwrap_or_default(),
             files => files_ctx,
             pastes => pastes_ctx,
         },
