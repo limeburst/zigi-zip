@@ -14,18 +14,18 @@ mod shortcode;
 mod wordlist;
 
 #[derive(Parser)]
-#[command(name = "zigi-zip", version, about = "zigi.zip file upload service")]
+#[command(name = "zigi-zip", version, about = "zigi.zip file upload service", arg_required_else_help = true)]
 struct Cli {
     #[arg(long, env = "ZIGI_CONFIG", default_value = "~/zigi-data/config.toml")]
     config: String,
 
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the HTTP server (default if no subcommand given)
+    /// Run the HTTP server
     Serve,
     /// Manage upload passwords
     Passwd {
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
 
     let pool = db::connect(&cfg.database_url).await?;
 
-    match cli.command.unwrap_or(Command::Serve) {
+    match cli.command {
         Command::Serve => server::run(cfg, pool).await?,
         Command::Migrate => db::migrate(&pool).await?,
         Command::Passwd { action } => match action {
