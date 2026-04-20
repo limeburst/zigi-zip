@@ -1,7 +1,11 @@
 [package]
-name = "zigi"
+name = "zigi-zip"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "zigi-zip"
+path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["multipart", "macros", "ws"] }

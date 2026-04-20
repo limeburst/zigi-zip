@@ -14,7 +14,7 @@ mod shortcode;
 mod wordlist;
 
 #[derive(Parser)]
-#[command(name = "zigi", version, about = "zigi.zip file upload service")]
+#[command(name = "zigi-zip", version, about = "zigi.zip file upload service")]
 struct Cli {
     #[arg(long, env = "ZIGI_CONFIG", default_value = "~/zigi-data/config.toml")]
     config: String,

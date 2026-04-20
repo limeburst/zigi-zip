@@ -6,7 +6,7 @@ set -euo pipefail
 
 SRC="${SRC:-$HOME/Git/zigi.zip}"
 DATA="${DATA:-$HOME/zigi-data}"
-BIN="$DATA/bin/zigi"
+BIN="$DATA/bin/zigi-zip"
 CONFIG="$DATA/config.toml"
 PG_BIN="/opt/homebrew/opt/postgresql@18/bin"
 LABEL="zip.zigi"
@@ -16,7 +16,7 @@ cd "$SRC"
 PATH="$PG_BIN:$PATH" cargo build --release
 
 echo "==> installing binary"
-install -m 755 "$SRC/target/release/zigi" "$BIN"
+install -m 755 "$SRC/target/release/zigi-zip" "$BIN"
 # macOS kills linker-signed binaries after a plain cp — re-sign ad-hoc.
 codesign --force --sign - "$BIN"
 

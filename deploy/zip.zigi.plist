@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/limeburst/zigi-data/bin/zigi</string>
+        <string>/Users/limeburst/zigi-data/bin/zigi-zip</string>
         <string>serve</string>
     </array>
 
