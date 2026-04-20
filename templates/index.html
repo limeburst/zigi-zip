@@ -1,0 +1,13 @@
+{% extends "layout.html" %}
+{% block extra_css %}
+ul.services { list-style: none; padding: 0; }
+ul.services li { padding: 0.5rem 0; }
+ul.services a { font-weight: 600; }
+{% endblock %}
+{% block body %}
+<h1>zigi.zip</h1>
+<ul class="services">
+  <li><a href="/upload">/upload</a> — upload a file, get a short link</li>
+  <li><a href="/code">/code</a> — new live collaborative editor</li>
+</ul>
+{% endblock %}

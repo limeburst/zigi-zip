@@ -18,7 +18,7 @@ use tokio_util::io::ReaderStream;
 
 use minijinja::context;
 
-use crate::{config::Config, links, passwd, paste, shortcode, templates};
+use crate::{config::Config, links, passwd, paste, shortcode, templates, watcher};
 
 #[derive(Clone)]
 struct AppState {
@@ -29,6 +29,7 @@ struct AppState {
 
 pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
     crate::db::migrate(&pool).await?;
+    watcher::spawn(pool.clone(), cfg.files_dir());
     let state = AppState {
         cfg: Arc::new(cfg.clone()),
         pool,
@@ -52,8 +53,8 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-async fn root() -> &'static str {
-    "zigi.zip"
+async fn root() -> Html<String> {
+    Html(templates::render("index.html", context! { title => "zigi.zip" }))
 }
 
 async fn upload_form() -> Html<String> {

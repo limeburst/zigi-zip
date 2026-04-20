@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 static ENV: Lazy<Environment<'static>> = Lazy::new(|| {
     let mut env = Environment::new();
     env.add_template("layout.html", include_str!("../templates/layout.html")).unwrap();
+    env.add_template("index.html", include_str!("../templates/index.html")).unwrap();
     env.add_template("upload_form.html", include_str!("../templates/upload_form.html")).unwrap();
     env.add_template("upload_success.html", include_str!("../templates/upload_success.html")).unwrap();
     env.add_template("paste_form.html", include_str!("../templates/paste_form.html")).unwrap();

@@ -9,6 +9,7 @@ mod passwd;
 mod paste;
 mod server;
 mod templates;
+mod watcher;
 mod shortcode;
 mod wordlist;
 
