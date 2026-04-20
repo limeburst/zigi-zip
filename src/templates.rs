@@ -9,6 +9,8 @@ static ENV: Lazy<Environment<'static>> = Lazy::new(|| {
     env.add_template("upload_success.html", include_str!("../templates/upload_success.html")).unwrap();
     env.add_template("paste_form.html", include_str!("../templates/paste_form.html")).unwrap();
     env.add_template("editor.html", include_str!("../templates/editor.html")).unwrap();
+    env.add_template("admin_login.html", include_str!("../templates/admin_login.html")).unwrap();
+    env.add_template("admin_view.html", include_str!("../templates/admin_view.html")).unwrap();
     env
 });
 

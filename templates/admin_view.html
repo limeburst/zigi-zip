@@ -1,0 +1,47 @@
+{% extends "layout.html" %}
+{% block extra_css %}
+h2 { margin-top: 2rem; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; vertical-align: top; }
+th { font-weight: 600; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+{% endblock %}
+{% block body %}
+<h1>zigi.zip · admin</h1>
+<p class="hint">signed in as <strong>{{ admin_label }}</strong></p>
+
+<h2>files ({{ files | length }})</h2>
+{% if files %}
+<table>
+  <thead><tr><th>code</th><th>filename</th><th>size</th><th>uploaded</th><th>by</th></tr></thead>
+  <tbody>
+  {% for f in files %}
+    <tr>
+      <td class="mono"><a href="/{{ f.code }}">{{ f.code }}</a></td>
+      <td>{{ f.original_name }}</td>
+      <td class="num">{{ f.size_bytes }}</td>
+      <td>{{ f.uploaded_at }}</td>
+      <td>{{ f.created_by_label }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+
+<h2>notes ({{ pastes | length }})</h2>
+{% if pastes %}
+<table>
+  <thead><tr><th>code</th><th>updated</th><th>by</th></tr></thead>
+  <tbody>
+  {% for p in pastes %}
+    <tr>
+      <td class="mono"><a href="/{{ p.code }}">{{ p.code }}</a></td>
+      <td>{{ p.updated_at }}</td>
+      <td>{{ p.created_by_label }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+{% endblock %}

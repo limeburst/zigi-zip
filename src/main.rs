@@ -52,6 +52,10 @@ enum PasswdAction {
     List,
     /// Revoke a password by label
     Revoke { label: String },
+    /// Promote a password to admin
+    Promote { label: String },
+    /// Demote a password (remove admin)
+    Demote { label: String },
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -100,6 +104,14 @@ async fn main() -> Result<()> {
             PasswdAction::Revoke { label } => {
                 passwd::revoke(&pool, &label).await?;
                 println!("Revoked '{}'", label);
+            }
+            PasswdAction::Promote { label } => {
+                passwd::set_admin(&pool, &label, true).await?;
+                println!("Promoted '{}' to admin", label);
+            }
+            PasswdAction::Demote { label } => {
+                passwd::set_admin(&pool, &label, false).await?;
+                println!("Demoted '{}'", label);
             }
         },
     }

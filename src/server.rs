@@ -43,6 +43,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
             get(upload_form).post(upload).layer(DefaultBodyLimit::disable()),
         )
         .route("/code", get(paste_form).post(create_paste))
+        .route("/admin", get(admin_login).post(admin_view))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
         .route("/:code/:rest", get(dispatch_code_with_rest))
@@ -70,6 +71,85 @@ async fn paste_form() -> Html<String> {
         "paste_form.html",
         context! { title => "zigi.zip · new paste" },
     ))
+}
+
+async fn admin_login() -> Html<String> {
+    Html(templates::render(
+        "admin_login.html",
+        context! { title => "zigi.zip · admin", error => "" },
+    ))
+}
+
+#[derive(Deserialize)]
+struct AdminForm {
+    password: String,
+}
+
+async fn admin_view(State(st): State<AppState>, Form(form): Form<AdminForm>) -> Response {
+    let (_, admin_label) = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return Html(templates::render(
+                "admin_login.html",
+                context! { title => "zigi.zip · admin", error => "invalid admin password" },
+            ))
+            .into_response();
+        }
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+
+    let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>, String)> = match sqlx::query_as(
+        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at, f.created_by_label
+         FROM files f JOIN links l ON l.id = f.link_id
+         ORDER BY f.uploaded_at DESC",
+    )
+    .fetch_all(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("files: {e}")),
+    };
+
+    let pastes: Vec<(String, chrono::DateTime<chrono::Utc>, String)> = match sqlx::query_as(
+        "SELECT l.short_code, p.updated_at, p.created_by_label
+         FROM pastes p JOIN links l ON l.id = p.link_id
+         ORDER BY p.updated_at DESC",
+    )
+    .fetch_all(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("pastes: {e}")),
+    };
+
+    let files_ctx: Vec<_> = files
+        .into_iter()
+        .map(|(code, name, size, at, by)| {
+            context! {
+                code => code, original_name => name, size_bytes => size,
+                uploaded_at => at.to_rfc3339(), created_by_label => by,
+            }
+        })
+        .collect();
+    let pastes_ctx: Vec<_> = pastes
+        .into_iter()
+        .map(|(code, at, by)| {
+            context! {
+                code => code, updated_at => at.to_rfc3339(), created_by_label => by,
+            }
+        })
+        .collect();
+
+    Html(templates::render(
+        "admin_view.html",
+        context! {
+            title => "zigi.zip · admin",
+            admin_label => admin_label,
+            files => files_ctx,
+            pastes => pastes_ctx,
+        },
+    ))
+    .into_response()
 }
 
 #[derive(Deserialize)]
