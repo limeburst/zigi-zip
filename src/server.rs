@@ -19,7 +19,7 @@ use tokio_util::io::ReaderStream;
 
 use minijinja::context;
 
-use crate::{config::Config, links, passwd, paste, shortcode, templates, watcher};
+use crate::{config::Config, links, passwd, paste, shortcode, templates, watcher, wordlist};
 
 #[derive(Clone)]
 struct AppState {
@@ -45,6 +45,9 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/code", get(paste_form).post(create_paste))
         .route("/admin", get(admin_login).post(admin_view))
         .route("/admin/delete", axum::routing::post(admin_delete))
+        .route("/admin/passwd/add", axum::routing::post(admin_passwd_add))
+        .route("/admin/passwd/revoke", axum::routing::post(admin_passwd_revoke))
+        .route("/admin/passwd/set-admin", axum::routing::post(admin_passwd_set_admin))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
         .route("/:code/:rest", get(dispatch_code_with_rest))
@@ -162,6 +165,99 @@ async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
     Ok(format!("deleted {code}"))
 }
 
+#[derive(Deserialize)]
+struct AdminPasswdAddForm {
+    password: String,
+    label: String,
+    new_password: String,
+    #[serde(default)]
+    generate: Option<String>,
+    #[serde(default)]
+    is_admin: Option<String>,
+}
+
+async fn admin_passwd_add(State(st): State<AppState>, Form(form): Form<AdminPasswdAddForm>) -> Response {
+    let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some((_, l))) => l,
+        Ok(None) => return admin_invalid_response(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let label = form.label.trim();
+    if label.is_empty() {
+        return render_admin(&st, &form.password, &admin_label, Some("label required".into())).await;
+    }
+    let generated = form.generate.is_some();
+    let new_pw = if generated {
+        wordlist::two_word()
+    } else if form.new_password.is_empty() {
+        return render_admin(&st, &form.password, &admin_label, Some("password required (or tick generate)".into())).await;
+    } else {
+        form.new_password.clone()
+    };
+    if let Err(e) = passwd::add(&st.pool, label, &new_pw).await {
+        return render_admin(&st, &form.password, &admin_label, Some(format!("add failed: {e}"))).await;
+    }
+    if form.is_admin.is_some() {
+        if let Err(e) = passwd::set_admin(&st.pool, label, true).await {
+            return render_admin(&st, &form.password, &admin_label, Some(format!("added '{label}' but promote failed: {e}"))).await;
+        }
+    }
+    let flash = if generated {
+        format!("added '{label}' — generated password: {new_pw}")
+    } else {
+        format!("added '{label}'")
+    };
+    render_admin(&st, &form.password, &admin_label, Some(flash)).await
+}
+
+#[derive(Deserialize)]
+struct AdminPasswdLabelForm {
+    password: String,
+    label: String,
+}
+
+async fn admin_passwd_revoke(State(st): State<AppState>, Form(form): Form<AdminPasswdLabelForm>) -> Response {
+    let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some((_, l))) => l,
+        Ok(None) => return admin_invalid_response(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let flash = match passwd::revoke(&st.pool, &form.label).await {
+        Ok(()) => format!("revoked '{}'", form.label),
+        Err(e) => format!("revoke failed: {e}"),
+    };
+    render_admin(&st, &form.password, &admin_label, Some(flash)).await
+}
+
+#[derive(Deserialize)]
+struct AdminPasswdSetAdminForm {
+    password: String,
+    label: String,
+    is_admin: String,
+}
+
+async fn admin_passwd_set_admin(State(st): State<AppState>, Form(form): Form<AdminPasswdSetAdminForm>) -> Response {
+    let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some((_, l))) => l,
+        Ok(None) => return admin_invalid_response(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let want_admin = form.is_admin == "true";
+    let flash = match passwd::set_admin(&st.pool, &form.label, want_admin).await {
+        Ok(()) => format!("{} '{}'", if want_admin { "promoted" } else { "demoted" }, form.label),
+        Err(e) => format!("update failed: {e}"),
+    };
+    render_admin(&st, &form.password, &admin_label, Some(flash)).await
+}
+
+fn admin_invalid_response() -> Response {
+    Html(templates::render(
+        "admin_login.html",
+        context! { title => "zigi.zip · admin", error => "invalid admin password" },
+    ))
+    .into_response()
+}
+
 async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: Option<String>) -> Response {
     let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>, String)> = match sqlx::query_as(
         "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at, f.created_by_label
@@ -205,6 +301,29 @@ async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: O
         })
         .collect();
 
+    let passwords: Vec<(String, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, bool)> =
+        match sqlx::query_as(
+            "SELECT label, created_at, revoked_at, is_admin FROM passwords ORDER BY created_at DESC",
+        )
+        .fetch_all(&st.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("passwords: {e}")),
+        };
+    let passwords_ctx: Vec<_> = passwords
+        .into_iter()
+        .map(|(label, created, revoked, admin)| {
+            context! {
+                label => label,
+                created_at => created.to_rfc3339(),
+                revoked_at => revoked.map(|d| d.to_rfc3339()),
+                is_admin => admin,
+                active => revoked.is_none(),
+            }
+        })
+        .collect();
+
     Html(templates::render(
         "admin_view.html",
         context! {
@@ -214,6 +333,7 @@ async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: O
             flash => flash.unwrap_or_default(),
             files => files_ctx,
             pastes => pastes_ctx,
+            passwords => passwords_ctx,
         },
     ))
     .into_response()

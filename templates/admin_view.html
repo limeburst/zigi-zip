@@ -64,4 +64,44 @@ form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
   </tbody>
 </table>
 {% else %}<p class="hint">none</p>{% endif %}
+
+<h2>passwords ({{ passwords | length }})</h2>
+<table>
+  <thead><tr><th>label</th><th>created</th><th>revoked</th><th>admin</th><th></th></tr></thead>
+  <tbody>
+  {% for pw in passwords %}
+    <tr>
+      <td>{{ pw.label }}</td>
+      <td>{{ pw.created_at }}</td>
+      <td>{{ pw.revoked_at or "—" }}</td>
+      <td>{{ "yes" if pw.is_admin else "no" }}</td>
+      <td>
+        {% if pw.active %}
+          <form class="inline" method="post" action="/admin/passwd/set-admin">
+            <input type="hidden" name="password" value="{{ password }}">
+            <input type="hidden" name="label" value="{{ pw.label }}">
+            <input type="hidden" name="is_admin" value="{{ 'false' if pw.is_admin else 'true' }}">
+            <button type="submit">{{ "demote" if pw.is_admin else "promote" }}</button>
+          </form>
+          <form class="inline" method="post" action="/admin/passwd/revoke" onsubmit="return confirm('revoke {{ pw.label }}?')">
+            <input type="hidden" name="password" value="{{ password }}">
+            <input type="hidden" name="label" value="{{ pw.label }}">
+            <button type="submit">revoke</button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h3>add password</h3>
+<form method="post" action="/admin/passwd/add">
+  <input type="hidden" name="password" value="{{ password }}">
+  <input type="text" name="label" placeholder="label" required autocomplete="off">
+  <input type="text" name="new_password" placeholder="password (leave empty if generating)" autocomplete="off">
+  <label><input type="checkbox" name="generate" value="1"> generate a two-word password</label>
+  <label><input type="checkbox" name="is_admin" value="1"> admin</label>
+  <button type="submit">add</button>
+</form>
 {% endblock %}
