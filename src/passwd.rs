@@ -43,6 +43,19 @@ pub async fn set_admin(pool: &PgPool, label: &str, is_admin: bool) -> Result<()>
     Ok(())
 }
 
+pub async fn rotate(pool: &PgPool, label: &str, password: &str) -> Result<()> {
+    let h = hash(password, DEFAULT_COST).context("hashing password")?;
+    let res = sqlx::query("UPDATE passwords SET bcrypt_hash = $1 WHERE label = $2 AND revoked_at IS NULL")
+        .bind(h)
+        .bind(label)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("no active password with label '{}'", label);
+    }
+    Ok(())
+}
+
 pub async fn revoke(pool: &PgPool, label: &str) -> Result<()> {
     let res = sqlx::query("UPDATE passwords SET revoked_at = now() WHERE label = $1 AND revoked_at IS NULL")
         .bind(label)

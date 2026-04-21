@@ -56,6 +56,16 @@ enum PasswdAction {
     Promote { label: String },
     /// Demote a password (remove admin)
     Demote { label: String },
+    /// Rotate an active password (replace its bcrypt hash)
+    Rotate {
+        label: String,
+        /// Provide the new password non-interactively
+        #[arg(long)]
+        password: Option<String>,
+        /// Generate a two-word password and print it
+        #[arg(long)]
+        generate: bool,
+    },
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -112,6 +122,19 @@ async fn main() -> Result<()> {
             PasswdAction::Demote { label } => {
                 passwd::set_admin(&pool, &label, false).await?;
                 println!("Demoted '{}'", label);
+            }
+            PasswdAction::Rotate { label, password, generate } => {
+                let (pw, generated) = match (password, generate) {
+                    (Some(p), _) => (p, false),
+                    (None, true) => (wordlist::two_word(), true),
+                    (None, false) => (rpassword::prompt_password("New password: ")?, false),
+                };
+                passwd::rotate(&pool, &label, &pw).await?;
+                if generated {
+                    println!("Rotated '{}': {}", label, pw);
+                } else {
+                    println!("Rotated '{}'", label);
+                }
             }
         },
     }

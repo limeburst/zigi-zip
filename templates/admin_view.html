@@ -104,4 +104,13 @@ form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
   <label><input type="checkbox" name="is_admin" value="1"> admin</label>
   <button type="submit">add</button>
 </form>
+
+<h3>rotate password</h3>
+<form method="post" action="/admin/passwd/rotate">
+  <input type="hidden" name="password" value="{{ password }}">
+  <input type="text" name="label" placeholder="label of existing password" required autocomplete="off">
+  <input type="text" name="new_password" placeholder="new password (leave empty if generating)" autocomplete="off">
+  <label><input type="checkbox" name="generate" value="1"> generate a two-word password</label>
+  <button type="submit">rotate</button>
+</form>
 {% endblock %}

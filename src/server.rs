@@ -48,6 +48,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/admin/passwd/add", axum::routing::post(admin_passwd_add))
         .route("/admin/passwd/revoke", axum::routing::post(admin_passwd_revoke))
         .route("/admin/passwd/set-admin", axum::routing::post(admin_passwd_set_admin))
+        .route("/admin/passwd/rotate", axum::routing::post(admin_passwd_rotate))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
         .route("/:code/:rest", get(dispatch_code_with_rest))
@@ -248,6 +249,47 @@ async fn admin_passwd_set_admin(State(st): State<AppState>, Form(form): Form<Adm
         Err(e) => format!("update failed: {e}"),
     };
     render_admin(&st, &form.password, &admin_label, Some(flash)).await
+}
+
+#[derive(Deserialize)]
+struct AdminPasswdRotateForm {
+    password: String,
+    label: String,
+    new_password: String,
+    #[serde(default)]
+    generate: Option<String>,
+}
+
+async fn admin_passwd_rotate(State(st): State<AppState>, Form(form): Form<AdminPasswdRotateForm>) -> Response {
+    let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some((_, l))) => l,
+        Ok(None) => return admin_invalid_response(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let label = form.label.trim();
+    if label.is_empty() {
+        return render_admin(&st, &form.password, &admin_label, Some("label required".into())).await;
+    }
+    let generated = form.generate.is_some();
+    let new_pw = if generated {
+        wordlist::two_word()
+    } else if form.new_password.is_empty() {
+        return render_admin(&st, &form.password, &admin_label, Some("new password required (or tick generate)".into())).await;
+    } else {
+        form.new_password.clone()
+    };
+    if let Err(e) = passwd::rotate(&st.pool, label, &new_pw).await {
+        return render_admin(&st, &form.password, &admin_label, Some(format!("rotate failed: {e}"))).await;
+    }
+    // If the admin rotated their own password, keep the page functional by
+    // echoing the new plaintext into subsequent hidden form fields.
+    let echo_password = if label == admin_label { new_pw.clone() } else { form.password.clone() };
+    let flash = if generated {
+        format!("rotated '{label}' — new password: {new_pw}")
+    } else {
+        format!("rotated '{label}'")
+    };
+    render_admin(&st, &echo_password, &admin_label, Some(flash)).await
 }
 
 fn admin_invalid_response() -> Response {
