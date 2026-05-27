@@ -1,0 +1,63 @@
+{% extends "layout.html" %}
+{% block extra_css %}
+body { max-width: min(1200px, 96vw); }
+h2 { margin-top: 2rem; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; table-layout: auto; }
+th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; vertical-align: top; white-space: nowrap; }
+td.filename { white-space: normal; word-break: break-all; }
+th { font-weight: 600; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+{% endblock %}
+{% block body %}
+<h1>zigi.zip · my stuff</h1>
+<p class="hint">signed in as <strong>{{ label }}</strong></p>
+
+<h2>files ({{ files | length }})</h2>
+{% if files %}
+<table>
+  <thead><tr><th>code</th><th>filename</th><th>size</th><th>uploaded</th></tr></thead>
+  <tbody>
+  {% for f in files %}
+    <tr>
+      <td class="mono"><a href="/{{ f.code }}">{{ f.code }}</a></td>
+      <td class="filename">{{ f.original_name }}</td>
+      <td class="num">{{ f.size_bytes }}</td>
+      <td>{{ f.uploaded_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+
+<h2>notes ({{ pastes | length }})</h2>
+{% if pastes %}
+<table>
+  <thead><tr><th>code</th><th>updated</th></tr></thead>
+  <tbody>
+  {% for p in pastes %}
+    <tr>
+      <td class="mono"><a href="/{{ p.code }}">{{ p.code }}</a></td>
+      <td>{{ p.updated_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+
+<h2>short links ({{ short_links | length }})</h2>
+{% if short_links %}
+<table>
+  <thead><tr><th>code</th><th>destination</th><th>created</th></tr></thead>
+  <tbody>
+  {% for s in short_links %}
+    <tr>
+      <td class="mono"><a href="/{{ s.code }}">{{ s.code }}</a></td>
+      <td class="filename">{{ s.destination_url }}</td>
+      <td>{{ s.created_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+{% endblock %}

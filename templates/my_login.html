@@ -1,0 +1,9 @@
+{% extends "layout.html" %}
+{% block body %}
+<h1>zigi.zip · my stuff</h1>
+{% if error %}<p class="hint" style="color:#c00">{{ error }}</p>{% endif %}
+<form method="post" action="/my">
+  <input type="password" name="password" placeholder="password" required autocomplete="current-password">
+  <button type="submit">sign in</button>
+</form>
+{% endblock %}

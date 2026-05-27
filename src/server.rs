@@ -49,6 +49,8 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/admin/passwd/revoke", axum::routing::post(admin_passwd_revoke))
         .route("/admin/passwd/set-admin", axum::routing::post(admin_passwd_set_admin))
         .route("/admin/passwd/rotate", axum::routing::post(admin_passwd_rotate))
+        .route("/my", get(my_login).post(my_view))
+        .route("/url", get(shorten_form).post(shorten))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
         .route("/:code/:rest", get(dispatch_code_with_rest))
@@ -325,6 +327,19 @@ async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: O
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("pastes: {e}")),
     };
 
+    let short_links: Vec<(String, String, chrono::DateTime<chrono::Utc>, String)> =
+        match sqlx::query_as(
+            "SELECT l.short_code, sl.destination_url, sl.created_at, sl.created_by_label
+             FROM short_links sl JOIN links l ON l.id = sl.link_id
+             ORDER BY sl.created_at DESC",
+        )
+        .fetch_all(&st.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("short_links: {e}")),
+        };
+
     let files_ctx: Vec<_> = files
         .into_iter()
         .map(|(code, name, size, at, by)| {
@@ -339,6 +354,14 @@ async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: O
         .map(|(code, at, by)| {
             context! {
                 code => code, updated_at => at.to_rfc3339(), created_by_label => by,
+            }
+        })
+        .collect();
+    let short_links_ctx: Vec<_> = short_links
+        .into_iter()
+        .map(|(code, dest, at, by)| {
+            context! {
+                code => code, destination_url => dest, created_at => at.to_rfc3339(), created_by_label => by,
             }
         })
         .collect();
@@ -375,6 +398,7 @@ async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: O
             flash => flash.unwrap_or_default(),
             files => files_ctx,
             pastes => pastes_ctx,
+            short_links => short_links_ctx,
             passwords => passwords_ctx,
         },
     ))
@@ -423,6 +447,7 @@ async fn dispatch_code(
         Ok(Some((link_id, kind))) => match kind.as_str() {
             "file" => serve_file(&st, link_id).await,
             "code" => serve_paste_editor(&st, &code).await,
+            "url" => serve_redirect(&st, link_id).await,
             _ => (StatusCode::NOT_FOUND, "unknown kind").into_response(),
         },
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -435,10 +460,8 @@ async fn dispatch_code_with_rest(
 ) -> Response {
     match links::lookup(&st.pool, &code).await {
         Ok(Some((link_id, kind))) if kind == "file" => serve_file(&st, link_id).await,
-        Ok(Some((_, kind))) if kind == "code" => {
-            // For pastes, any extra path after the code just shows the editor.
-            serve_paste_editor(&st, &code).await
-        }
+        Ok(Some((_, kind))) if kind == "code" => serve_paste_editor(&st, &code).await,
+        Ok(Some((link_id, kind))) if kind == "url" => serve_redirect(&st, link_id).await,
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
@@ -511,6 +534,174 @@ async fn paste_ws(
     ws.max_message_size(usize::MAX)
         .max_frame_size(usize::MAX)
         .on_upgrade(move |socket| paste::handle_ws(socket, doc))
+}
+
+async fn serve_redirect(st: &AppState, link_id: i64) -> Response {
+    let dest: Option<String> =
+        sqlx::query_scalar("SELECT destination_url FROM short_links WHERE link_id = $1")
+            .bind(link_id)
+            .fetch_optional(&st.pool)
+            .await
+            .unwrap_or(None);
+    match dest {
+        Some(url) => Redirect::to(&url).into_response(),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+async fn my_login() -> Html<String> {
+    Html(templates::render(
+        "my_login.html",
+        context! { title => "zigi.zip · my stuff", error => "" },
+    ))
+}
+
+#[derive(Deserialize)]
+struct MyForm {
+    password: String,
+}
+
+async fn my_view(State(st): State<AppState>, Form(form): Form<MyForm>) -> Response {
+    let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return Html(templates::render(
+                "my_login.html",
+                context! { title => "zigi.zip · my stuff", error => "invalid password" },
+            ))
+            .into_response();
+        }
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+
+    let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
+        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at
+         FROM files f JOIN links l ON l.id = f.link_id
+         WHERE f.uploaded_by = $1
+         ORDER BY f.uploaded_at DESC",
+    )
+    .bind(pw_id)
+    .fetch_all(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("files: {e}")),
+    };
+
+    let pastes: Vec<(String, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
+        "SELECT l.short_code, p.updated_at
+         FROM pastes p JOIN links l ON l.id = p.link_id
+         WHERE p.created_by = $1
+         ORDER BY p.updated_at DESC",
+    )
+    .bind(pw_id)
+    .fetch_all(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("pastes: {e}")),
+    };
+
+    let short_links: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
+        "SELECT l.short_code, sl.destination_url, sl.created_at
+         FROM short_links sl JOIN links l ON l.id = sl.link_id
+         WHERE sl.created_by = $1
+         ORDER BY sl.created_at DESC",
+    )
+    .bind(pw_id)
+    .fetch_all(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("short_links: {e}")),
+    };
+
+    let files_ctx: Vec<_> = files
+        .into_iter()
+        .map(|(code, name, size, at)| {
+            context! {
+                code => code, original_name => name, size_bytes => size,
+                uploaded_at => at.to_rfc3339(),
+            }
+        })
+        .collect();
+    let pastes_ctx: Vec<_> = pastes
+        .into_iter()
+        .map(|(code, at)| context! { code => code, updated_at => at.to_rfc3339() })
+        .collect();
+    let short_links_ctx: Vec<_> = short_links
+        .into_iter()
+        .map(|(code, dest, at)| {
+            context! { code => code, destination_url => dest, created_at => at.to_rfc3339() }
+        })
+        .collect();
+
+    Html(templates::render(
+        "my_view.html",
+        context! {
+            title => "zigi.zip · my stuff",
+            label => pw_label,
+            files => files_ctx,
+            pastes => pastes_ctx,
+            short_links => short_links_ctx,
+        },
+    ))
+    .into_response()
+}
+
+async fn shorten_form() -> Html<String> {
+    Html(templates::render(
+        "shorten_form.html",
+        context! { title => "zigi.zip · shorten" },
+    ))
+}
+
+#[derive(Deserialize)]
+struct ShortenForm {
+    password: String,
+    url: String,
+}
+
+async fn shorten(State(st): State<AppState>, Form(form): Form<ShortenForm>) -> Response {
+    let url = form.url.trim().to_string();
+    if url.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "missing url".into());
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return err(StatusCode::BAD_REQUEST, "url must start with http:// or https://".into());
+    }
+
+    let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return err(StatusCode::UNAUTHORIZED, "invalid password".into()),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+
+    let (link_id, code) = match links::allocate(&st.pool, links::KIND_URL).await {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")),
+    };
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO short_links (link_id, destination_url, created_by, created_by_label) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(link_id)
+    .bind(&url)
+    .bind(pw_id)
+    .bind(&pw_label)
+    .execute(&st.pool)
+    .await
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("insert: {e}"));
+    }
+
+    let short_url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), code);
+    let qr_svg = qr_svg(&short_url).unwrap_or_default();
+    Html(templates::render(
+        "shorten_success.html",
+        context! { title => "shortened", short_url => short_url, destination_url => url, qr_svg => qr_svg },
+    ))
+    .into_response()
 }
 
 // ---------- file upload (unchanged logic, updated to use links table) ----------

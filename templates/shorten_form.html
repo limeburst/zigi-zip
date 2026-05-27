@@ -1,0 +1,9 @@
+{% extends "layout.html" %}
+{% block body %}
+<h1>zigi.zip · shorten</h1>
+<form method="post" action="/url">
+  <input type="password" name="password" placeholder="password" required autocomplete="current-password">
+  <input type="url" name="url" placeholder="https://..." required autocomplete="off" style="width:24rem">
+  <button type="submit">shorten</button>
+</form>
+{% endblock %}

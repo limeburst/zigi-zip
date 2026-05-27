@@ -65,6 +65,30 @@ form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
 </table>
 {% else %}<p class="hint">none</p>{% endif %}
 
+<h2>short links ({{ short_links | length }})</h2>
+{% if short_links %}
+<table>
+  <thead><tr><th>code</th><th>destination</th><th>created</th><th>by</th><th></th></tr></thead>
+  <tbody>
+  {% for s in short_links %}
+    <tr>
+      <td class="mono"><a href="/{{ s.code }}">{{ s.code }}</a></td>
+      <td class="filename">{{ s.destination_url }}</td>
+      <td>{{ s.created_at }}</td>
+      <td>{{ s.created_by_label }}</td>
+      <td>
+        <form class="inline" method="post" action="/admin/delete" onsubmit="return confirm('delete {{ s.code }}?')">
+          <input type="hidden" name="password" value="{{ password }}">
+          <input type="hidden" name="code" value="{{ s.code }}">
+          <button type="submit">delete</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+
 <h2>passwords ({{ passwords | length }})</h2>
 <table>
   <thead><tr><th>label</th><th>created</th><th>revoked</th><th>admin</th><th></th></tr></thead>

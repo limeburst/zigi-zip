@@ -5,6 +5,7 @@ use crate::shortcode;
 
 pub const KIND_FILE: &str = "file";
 pub const KIND_CODE: &str = "code";
+pub const KIND_URL: &str = "url";
 
 /// Allocate a new link row with a unique short code. Starts at 3 chars and grows
 /// the code length after a few consecutive collisions, so URLs stay as short as
