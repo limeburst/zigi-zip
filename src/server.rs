@@ -19,19 +19,20 @@ use tokio_util::io::ReaderStream;
 
 use minijinja::context;
 
-use crate::{config::Config, links, passwd, paste, shortcode, templates, watcher, wordlist};
+use crate::{config::Config, links, passwd, paste, shortcode, storage::Storage, templates, wordlist};
 
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
     pool: PgPool,
     pastes: paste::Registry,
+    store: Storage,
 }
 
 pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
     crate::db::migrate(&pool).await?;
-    watcher::spawn(pool.clone(), cfg.files_dir());
     let state = AppState {
+        store: Storage::new(&cfg.r2),
         cfg: Arc::new(cfg.clone()),
         pool,
         pastes: paste::Registry::default(),
@@ -132,8 +133,8 @@ async fn admin_delete(State(st): State<AppState>, Form(form): Form<AdminDeleteFo
     render_admin(&st, &form.password, &admin_label, Some(msg)).await
 }
 
-/// Delete the link with `code` and — for file links — remove the on-disk
-/// blob only when no other links still reference that `stored_path`.
+/// Delete the link with `code` and — for file links — remove the R2 object
+/// only when no other links still reference that `object_key`.
 async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
     let link: Option<(i64, String)> =
         sqlx::query_as("SELECT id, kind FROM links WHERE short_code = $1")
@@ -143,8 +144,8 @@ async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
     let Some((link_id, kind)) = link else {
         return Ok(format!("{code}: not found"));
     };
-    let stored_path: Option<String> = if kind == links::KIND_FILE {
-        sqlx::query_scalar("SELECT stored_path FROM files WHERE link_id = $1")
+    let object_key: Option<String> = if kind == links::KIND_FILE {
+        sqlx::query_scalar("SELECT object_key FROM files WHERE link_id = $1")
             .bind(link_id)
             .fetch_optional(&st.pool)
             .await?
@@ -155,14 +156,18 @@ async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
         .bind(link_id)
         .execute(&st.pool)
         .await?;
-    if let Some(sp) = stored_path {
+    if let Some(key) = object_key {
         let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE stored_path = $1")
-                .bind(&sp)
+            sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE object_key = $1")
+                .bind(&key)
                 .fetch_one(&st.pool)
                 .await?;
         if remaining == 0 {
-            let _ = tokio::fs::remove_file(&sp).await;
+            if let Err(e) = st.store.delete(&key).await {
+                // The row is already gone; a stray object is cheaper than a
+                // failed admin action, so log it rather than erroring out.
+                tracing::warn!(key = %key, ?e, "failed to delete object from R2");
+            }
         }
     }
     Ok(format!("deleted {code}"))
@@ -468,7 +473,7 @@ async fn dispatch_code_with_rest(
 
 async fn serve_file(st: &AppState, link_id: i64) -> Response {
     let row: Option<(String, String, Option<String>, i64)> = match sqlx::query_as(
-        "SELECT original_name, stored_path, content_type, size_bytes FROM files WHERE link_id = $1",
+        "SELECT original_name, object_key, content_type, size_bytes FROM files WHERE link_id = $1",
     )
     .bind(link_id)
     .fetch_optional(&st.pool)
@@ -477,19 +482,23 @@ async fn serve_file(st: &AppState, link_id: i64) -> Response {
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")).into_response(),
     };
-    let Some((original_name, stored_path, content_type, size)) = row else {
+    let Some((original_name, object_key, content_type, size)) = row else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    let f = match File::open(&stored_path).await {
-        Ok(f) => f,
-        Err(_) => return (StatusCode::NOT_FOUND, "file missing on disk").into_response(),
+    let object = match st.store.get(&object_key).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return (StatusCode::NOT_FOUND, "file missing in storage").into_response(),
+        Err(e) => {
+            tracing::error!(key = %object_key, ?e, "R2 get failed");
+            return (StatusCode::BAD_GATEWAY, "storage unavailable").into_response();
+        }
     };
     let ct = content_type.unwrap_or_else(|| {
         mime_guess::from_path(&original_name)
             .first_or_octet_stream()
             .to_string()
     });
-    let stream = ReaderStream::new(f);
+    let stream = ReaderStream::new(object.into_async_read());
     let body = Body::from_stream(stream);
     let encoded = percent_encoding::utf8_percent_encode(&original_name, percent_encoding::NON_ALPHANUMERIC)
         .to_string();
@@ -704,7 +713,7 @@ async fn shorten(State(st): State<AppState>, Form(form): Form<ShortenForm>) -> R
     .into_response()
 }
 
-// ---------- file upload (unchanged logic, updated to use links table) ----------
+// ---------- file upload ----------
 
 async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
     let mut password: Option<String> = None;
@@ -719,7 +728,10 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
             "file" => {
                 let original_name = field.file_name().map(|s| s.to_string()).unwrap_or_else(|| "file".into());
                 let content_type = field.content_type().map(|s| s.to_string());
-                let tmp = st.cfg.files_dir().join(format!(".tmp-{}", shortcode::generate(12)));
+                // Spool to local scratch first: we need the whole body to know
+                // its SHA-256 (the object key) and its length before R2 will
+                // take it. The temp file never outlives this request.
+                let tmp = st.cfg.tmp_dir().join(format!(".tmp-{}", shortcode::generate(12)));
                 let mut f = match File::create(&tmp).await {
                     Ok(f) => f,
                     Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("create tmp: {e}")),
@@ -773,35 +785,35 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
         }
     };
 
-    let (link_id, code) = match links::allocate(&st.pool, links::KIND_FILE).await {
-        Ok(v) => v,
+    // Content-addressed storage: the object key is the hash, so identical
+    // content always lands at the same key and dedup is a property of the
+    // key space. put_file_if_absent skips the transfer on a dedup hit.
+    let fresh_object = match st
+        .store
+        .put_file_if_absent(&content_hash, &tmp, content_type.as_deref())
+        .await
+    {
+        Ok(fresh) => fresh,
         Err(e) => {
             let _ = tokio::fs::remove_file(&tmp).await;
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}"));
+            tracing::error!(key = %content_hash, ?e, "R2 upload failed");
+            return err(StatusCode::BAD_GATEWAY, "storage upload failed".into());
         }
     };
+    let _ = tokio::fs::remove_file(&tmp).await;
 
-    // Content-addressed storage: path is derived from the hash, so identical
-    // content always lands at the same path and dedup is a filesystem property.
-    let final_path = st.cfg.files_dir().join(&content_hash);
-    let fresh_file = !tokio::fs::try_exists(&final_path).await.unwrap_or(false);
-    if fresh_file {
-        if let Err(e) = tokio::fs::rename(&tmp, &final_path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}"));
-        }
-    } else {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-    let stored_path = final_path.to_string_lossy().to_string();
+    let (link_id, code) = match links::allocate(&st.pool, links::KIND_FILE).await {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")),
+    };
 
     let insert = sqlx::query(
-        "INSERT INTO files (link_id, original_name, stored_path, content_type, size_bytes, uploaded_by, created_by_label, content_hash)
+        "INSERT INTO files (link_id, original_name, object_key, content_type, size_bytes, uploaded_by, created_by_label, content_hash)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
     )
     .bind(link_id)
     .bind(&original_name)
-    .bind(&stored_path)
+    .bind(&content_hash)
     .bind(content_type.as_deref())
     .bind(size)
     .bind(pw_id)
@@ -810,8 +822,8 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
     .execute(&st.pool)
     .await;
     if let Err(e) = insert {
-        if fresh_file {
-            let _ = tokio::fs::remove_file(&final_path).await;
+        if fresh_object {
+            let _ = st.store.delete(&content_hash).await;
         }
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db insert: {e}"));
     }

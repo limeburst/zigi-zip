@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Rebuild, migrate, and restart the zigi service. Run on the mac mini server.
-# Assumes source is at ~/Git/zigi.zip and data dir is ~/zigi-data.
+# Assumes source is at ~/Git/zigi-zip and data dir is ~/zigi-data.
 
 set -euo pipefail
 
-SRC="${SRC:-$HOME/Git/zigi.zip}"
+SRC="${SRC:-$HOME/Git/zigi-zip}"
 DATA="${DATA:-$HOME/zigi-data}"
 BIN="$DATA/bin/zigi-zip"
 CONFIG="$DATA/config.toml"
