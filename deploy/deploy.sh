@@ -26,10 +26,16 @@ echo "==> running migrations"
 echo "==> restarting launchd agent"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
-# Give it a moment to come up, then smoke-test.
-sleep 1
+# Smoke-test once it is up. macOS kills the first exec of a freshly signed
+# binary (OS_REASON_CODESIGNING) and KeepAlive restarts it, so a single
+# one-second check races that restart and reports a healthy deploy as failed.
 LISTEN="$(awk -F'"' '/^listen/ {print $2}' "$CONFIG")"
-code=$(curl -sS -o /dev/null -w "%{http_code}" "http://$LISTEN/")
+code=000
+for _ in $(seq 30); do
+    sleep 1
+    code=$(curl -sS -o /dev/null -w "%{http_code}" "http://$LISTEN/" || echo 000)
+    [[ "$code" == "200" ]] && break
+done
 echo "==> GET / -> $code"
 if [[ "$code" != "200" ]]; then
     echo "service did not come back up; check $DATA/zigi.err.log" >&2
