@@ -99,9 +99,8 @@ async fn main() -> Result<()> {
         Command::Serve => server::run(cfg, pool).await?,
         Command::Migrate => db::migrate(&pool).await?,
         Command::MigrateStorage => {
-            db::migrate(&pool).await?;
             let store = storage::Storage::new(&cfg.r2);
-            storage::migrate_local_files(&pool, &store, &cfg.legacy_files_dir()).await?;
+            storage::migrate_local_files(&store, &cfg.legacy_files_dir()).await?;
         }
         Command::Passwd { action } => match action {
             PasswdAction::Add { label, password, generate } => {

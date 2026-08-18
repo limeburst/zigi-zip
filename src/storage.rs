@@ -236,49 +236,53 @@ impl Storage {
 }
 
 /// One-shot backfill: push every blob still sitting in the pre-R2 files
-/// directory up to the bucket. Idempotent — objects already in R2 are
-/// skipped — so it is safe to re-run after a partial or interrupted pass.
-pub async fn migrate_local_files(
-    pool: &sqlx::PgPool,
-    store: &Storage,
-    legacy_dir: &Path,
-) -> Result<()> {
-    let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT DISTINCT ON (object_key) object_key, content_type, size_bytes
-           FROM files ORDER BY object_key",
-    )
-    .fetch_all(pool)
-    .await
-    .context("listing files rows")?;
+/// directory up to the bucket.
+///
+/// Deliberately reads the directory rather than the `files` table: blob names
+/// there are already their own content hash, i.e. exactly the R2 key. That
+/// keeps this runnable against a live server *before* the schema migration,
+/// so the bucket is fully populated by the time anything switches over.
+/// Idempotent — objects already in R2 are skipped — so a partial or
+/// interrupted pass can simply be re-run.
+pub async fn migrate_local_files(store: &Storage, legacy_dir: &Path) -> Result<()> {
+    let mut keys = Vec::new();
+    let mut dir = tokio::fs::read_dir(legacy_dir)
+        .await
+        .with_context(|| format!("reading {}", legacy_dir.display()))?;
+    while let Some(entry) = dir.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip in-flight temp uploads and anything not content-addressed.
+        if name.len() != 64 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            tracing::warn!(name = %name, "skipping non-content-addressed entry");
+            continue;
+        }
+        if entry.file_type().await?.is_file() {
+            keys.push(name);
+        }
+    }
+    keys.sort();
 
-    let total = rows.len();
+    let total = keys.len();
     tracing::info!(total, bucket = store.bucket(), "migrating blobs to R2");
 
-    let (mut uploaded, mut skipped, mut missing, mut failed) = (0u64, 0u64, 0u64, 0u64);
+    let (mut uploaded, mut skipped, mut failed) = (0u64, 0u64, 0u64);
     let mut bytes = 0u64;
-    for (i, (key, content_type, size)) in rows.into_iter().enumerate() {
+    for (i, key) in keys.into_iter().enumerate() {
         let n = i + 1;
-        if store.exists(&key).await.context("head during migration")? {
-            skipped += 1;
-            continue;
-        }
         let path = legacy_dir.join(&key);
-        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            tracing::warn!(key = %key, path = %path.display(), "blob missing on disk, skipping");
-            missing += 1;
-            continue;
-        }
-        match store
-            .put_file_if_absent(&key, &path, content_type.as_deref())
-            .await
-        {
-            Ok(_) => {
+        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        match store.put_file_if_absent(&key, &path, None).await {
+            Ok(true) => {
                 uploaded += 1;
-                bytes += size.max(0) as u64;
+                bytes += size;
                 tracing::info!(
                     "[{n}/{total}] uploaded {key} ({:.1} MiB)",
                     size as f64 / (1024.0 * 1024.0)
                 );
+            }
+            Ok(false) => {
+                skipped += 1;
+                tracing::info!("[{n}/{total}] already in bucket: {key}");
             }
             Err(e) => {
                 failed += 1;
@@ -290,7 +294,6 @@ pub async fn migrate_local_files(
     tracing::info!(
         uploaded,
         skipped,
-        missing,
         failed,
         mib = bytes / (1024 * 1024),
         "migration pass complete"
