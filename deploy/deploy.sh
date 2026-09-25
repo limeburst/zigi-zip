@@ -10,6 +10,10 @@
 #     kept out of the repo because it holds secrets
 #   - the launchd agent from deploy/zip.zigi.plist
 #
+# Refuses to run with uncommitted or untracked changes, so what ships is
+# always a commit. `mise run rollback` (deploy/rollback.sh) swaps the previous
+# binary back in.
+#
 # DEPLOY_HOST overrides the ssh destination (user@host or a ~/.ssh/config alias).
 # The server's data dir defaults to ~/zigi-data; override with REMOTE_DATA.
 
@@ -20,6 +24,12 @@ REMOTE_DATA="${REMOTE_DATA:-zigi-data}" # relative paths resolve against the rem
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/zigi-zip/production}"
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 STAGE="$REMOTE_DATA/.deploy"
+
+if [[ -n "$(git -C "$SRC" status --porcelain)" ]]; then
+    echo "working directory is dirty; commit or stash before deploying:" >&2
+    git -C "$SRC" status --short >&2
+    exit 1
+fi
 
 if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
     echo "missing $CONFIG_DIR/config.toml (see deploy/config.example.toml)" >&2
@@ -34,7 +44,7 @@ if [[ "$local_platform" != "$remote_platform" ]]; then
     exit 1
 fi
 
-echo "==> building release binary"
+echo "==> building release binary at $(git -C "$SRC" rev-parse --short HEAD)"
 cd "$SRC"
 cargo build --release
 
@@ -45,7 +55,7 @@ scp -q \
     "$SRC/deploy/zip.zigi.plist" \
     "$HOST:$STAGE/"
 
-ssh "$HOST" bash -s -- "$REMOTE_DATA" <<'REMOTE'
+{ cat <<'REMOTE'; cat "$SRC/deploy/smoke-test.sh"; } | ssh "$HOST" bash -s -- "$REMOTE_DATA"
 set -euo pipefail
 cd "$HOME"
 DATA="$1"
@@ -79,6 +89,9 @@ chmod 755 "$STAGE/zigi-zip"
 # macOS kills linker-signed binaries after a plain copy — re-sign ad-hoc, then
 # swap it in with a rename so the running service never sees a partial file.
 codesign --force --sign - "$STAGE/zigi-zip"
+# Keep the outgoing binary for rollback.sh. A hard link, not a move, so $BIN
+# never disappears — KeepAlive may exec it at any moment.
+ln -f "$BIN" "$BIN.prev"
 mv -f "$STAGE/zigi-zip" "$BIN"
 
 echo "==> running migrations"
@@ -96,22 +109,6 @@ if [[ "$plist_changed" == 1 ]]; then
 else
     echo "==> restarting launchd agent"
     launchctl kickstart -k "$DOMAIN/$LABEL"
-fi
-
-# Smoke-test once it is up. macOS kills the first exec of a freshly signed
-# binary (OS_REASON_CODESIGNING) and KeepAlive restarts it, so a single
-# one-second check races that restart and reports a healthy deploy as failed.
-LISTEN="$(awk -F'"' '/^listen/ {print $2}' "$CONFIG")"
-code=000
-for _ in $(seq 30); do
-    sleep 1
-    code=$(curl -sS -o /dev/null -w "%{http_code}" "http://$LISTEN/" 2>/dev/null || echo 000)
-    [[ "$code" == "200" ]] && break
-done
-echo "==> GET / -> $code"
-if [[ "$code" != "200" ]]; then
-    echo "service did not come back up; check $DATA/zigi.err.log" >&2
-    exit 1
 fi
 REMOTE
 

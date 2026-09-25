@@ -46,3 +46,7 @@ run = "cargo fmt"
 [tasks.deploy]
 description = "Build locally and deploy the binary and configuration to production"
 run = "deploy/deploy.sh"
+
+[tasks.rollback]
+description = "Swap the previously deployed binary back in (run again to undo)"
+run = "deploy/rollback.sh"
