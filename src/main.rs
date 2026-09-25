@@ -8,13 +8,18 @@ mod links;
 mod passwd;
 mod paste;
 mod server;
+mod shortcode;
 mod storage;
 mod templates;
-mod shortcode;
 mod wordlist;
 
 #[derive(Parser)]
-#[command(name = "zigi-zip", version, about = "zigi.zip file upload service", arg_required_else_help = true)]
+#[command(
+    name = "zigi-zip",
+    version,
+    about = "zigi.zip file upload service",
+    arg_required_else_help = true
+)]
 struct Cli {
     #[arg(long, env = "ZIGI_CONFIG", default_value = "~/zigi-data/config.toml")]
     config: String,
@@ -103,7 +108,11 @@ async fn main() -> Result<()> {
             storage::migrate_local_files(&store, &cfg.legacy_files_dir()).await?;
         }
         Command::Passwd { action } => match action {
-            PasswdAction::Add { label, password, generate } => {
+            PasswdAction::Add {
+                label,
+                password,
+                generate,
+            } => {
                 let (pw, generated) = match (password, generate) {
                     (Some(p), _) => (p, false),
                     (None, true) => (wordlist::two_word(), true),
@@ -129,7 +138,11 @@ async fn main() -> Result<()> {
                 passwd::set_admin(&pool, &label, false).await?;
                 println!("Demoted '{}'", label);
             }
-            PasswdAction::Rotate { label, password, generate } => {
+            PasswdAction::Rotate {
+                label,
+                password,
+                generate,
+            } => {
                 let (pw, generated) = match (password, generate) {
                     (Some(p), _) => (p, false),
                     (None, true) => (wordlist::two_word(), true),

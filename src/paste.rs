@@ -6,8 +6,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, Mutex, Notify};
 use yrs::{
     sync::{
-        protocol::MSG_SYNC_UPDATE,
-        Awareness, DefaultProtocol, Message, MessageReader, Protocol, SyncMessage,
+        protocol::MSG_SYNC_UPDATE, Awareness, DefaultProtocol, Message, MessageReader, Protocol,
+        SyncMessage,
     },
     updates::{
         decoder::{Decode, DecoderV1},
@@ -151,9 +151,8 @@ async fn handle_incoming(
         );
         let update_bytes = if is_update {
             match &message {
-                Message::Sync(SyncMessage::Update(u)) | Message::Sync(SyncMessage::SyncStep2(u)) => {
-                    Some(u.clone())
-                }
+                Message::Sync(SyncMessage::Update(u))
+                | Message::Sync(SyncMessage::SyncStep2(u)) => Some(u.clone()),
                 _ => None,
             }
         } else {

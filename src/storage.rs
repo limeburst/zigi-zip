@@ -270,7 +270,10 @@ pub async fn migrate_local_files(store: &Storage, legacy_dir: &Path) -> Result<(
     for (i, key) in keys.into_iter().enumerate() {
         let n = i + 1;
         let path = legacy_dir.join(&key);
-        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         match store.put_file_if_absent(&key, &path, None).await {
             Ok(true) => {
                 uploaded += 1;

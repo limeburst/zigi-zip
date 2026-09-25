@@ -13,18 +13,29 @@ pub async fn add(pool: &PgPool, label: &str, password: &str) -> Result<()> {
 }
 
 pub async fn list(pool: &PgPool) -> Result<()> {
-    let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, bool)>(
-        "SELECT label, created_at, revoked_at, is_admin FROM passwords ORDER BY id",
-    )
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            chrono::DateTime<chrono::Utc>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            bool,
+        ),
+    >("SELECT label, created_at, revoked_at, is_admin FROM passwords ORDER BY id")
     .fetch_all(pool)
     .await?;
-    println!("{:<24} {:<28} {:<28} {}", "LABEL", "CREATED", "REVOKED", "ADMIN");
+    println!(
+        "{:<24} {:<28} {:<28} {}",
+        "LABEL", "CREATED", "REVOKED", "ADMIN"
+    );
     for (label, created, revoked, admin) in rows {
         println!(
             "{:<24} {:<28} {:<28} {}",
             label,
             created.to_rfc3339(),
-            revoked.map(|d| d.to_rfc3339()).unwrap_or_else(|| "-".into()),
+            revoked
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
             if admin { "yes" } else { "no" },
         );
     }
@@ -32,11 +43,12 @@ pub async fn list(pool: &PgPool) -> Result<()> {
 }
 
 pub async fn set_admin(pool: &PgPool, label: &str, is_admin: bool) -> Result<()> {
-    let res = sqlx::query("UPDATE passwords SET is_admin = $1 WHERE label = $2 AND revoked_at IS NULL")
-        .bind(is_admin)
-        .bind(label)
-        .execute(pool)
-        .await?;
+    let res =
+        sqlx::query("UPDATE passwords SET is_admin = $1 WHERE label = $2 AND revoked_at IS NULL")
+            .bind(is_admin)
+            .bind(label)
+            .execute(pool)
+            .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!("no active password with label '{}'", label);
     }
@@ -45,11 +57,13 @@ pub async fn set_admin(pool: &PgPool, label: &str, is_admin: bool) -> Result<()>
 
 pub async fn rotate(pool: &PgPool, label: &str, password: &str) -> Result<()> {
     let h = hash(password, DEFAULT_COST).context("hashing password")?;
-    let res = sqlx::query("UPDATE passwords SET bcrypt_hash = $1 WHERE label = $2 AND revoked_at IS NULL")
-        .bind(h)
-        .bind(label)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query(
+        "UPDATE passwords SET bcrypt_hash = $1 WHERE label = $2 AND revoked_at IS NULL",
+    )
+    .bind(h)
+    .bind(label)
+    .execute(pool)
+    .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!("no active password with label '{}'", label);
     }
@@ -57,10 +71,12 @@ pub async fn rotate(pool: &PgPool, label: &str, password: &str) -> Result<()> {
 }
 
 pub async fn revoke(pool: &PgPool, label: &str) -> Result<()> {
-    let res = sqlx::query("UPDATE passwords SET revoked_at = now() WHERE label = $1 AND revoked_at IS NULL")
-        .bind(label)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query(
+        "UPDATE passwords SET revoked_at = now() WHERE label = $1 AND revoked_at IS NULL",
+    )
+    .bind(label)
+    .execute(pool)
+    .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!("no active password with label '{}'", label);
     }

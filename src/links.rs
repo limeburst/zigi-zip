@@ -15,13 +15,12 @@ pub async fn allocate(pool: &PgPool, kind: &str) -> Result<(i64, String)> {
     let mut attempts_at_len: u32 = 0;
     loop {
         let code = shortcode::generate(len);
-        let res: std::result::Result<(i64,), sqlx::Error> = sqlx::query_as(
-            "INSERT INTO links (short_code, kind) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(&code)
-        .bind(kind)
-        .fetch_one(pool)
-        .await;
+        let res: std::result::Result<(i64,), sqlx::Error> =
+            sqlx::query_as("INSERT INTO links (short_code, kind) VALUES ($1, $2) RETURNING id")
+                .bind(&code)
+                .bind(kind)
+                .fetch_one(pool)
+                .await;
         match res {
             Ok((id,)) => return Ok((id, code)),
             Err(sqlx::Error::Database(dbe)) if dbe.constraint() == Some("links_short_code_key") => {
@@ -40,11 +39,10 @@ pub async fn allocate(pool: &PgPool, kind: &str) -> Result<(i64, String)> {
 
 /// (link_id, kind) for a short code, if any.
 pub async fn lookup(pool: &PgPool, code: &str) -> Result<Option<(i64, String)>> {
-    let row: Option<(i64, String)> = sqlx::query_as(
-        "SELECT id, kind FROM links WHERE short_code = $1",
-    )
-    .bind(code)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT id, kind FROM links WHERE short_code = $1")
+            .bind(code)
+            .fetch_optional(pool)
+            .await?;
     Ok(row)
 }

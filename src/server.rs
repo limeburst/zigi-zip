@@ -7,19 +7,21 @@ use axum::{
     routing::get,
     Router,
 };
+use futures::TryStreamExt;
 #[allow(unused_imports)]
 use percent_encoding;
-use futures::TryStreamExt;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::{path::PathBuf, sync::Arc};
-use sha2::{Digest, Sha256};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
 use minijinja::context;
 
-use crate::{config::Config, links, passwd, paste, shortcode, storage::Storage, templates, wordlist};
+use crate::{
+    config::Config, links, passwd, paste, shortcode, storage::Storage, templates, wordlist,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -41,15 +43,26 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/", get(root))
         .route(
             "/file",
-            get(upload_form).post(upload).layer(DefaultBodyLimit::disable()),
+            get(upload_form)
+                .post(upload)
+                .layer(DefaultBodyLimit::disable()),
         )
         .route("/code", get(paste_form).post(create_paste))
         .route("/admin", get(admin_login).post(admin_view))
         .route("/admin/delete", axum::routing::post(admin_delete))
         .route("/admin/passwd/add", axum::routing::post(admin_passwd_add))
-        .route("/admin/passwd/revoke", axum::routing::post(admin_passwd_revoke))
-        .route("/admin/passwd/set-admin", axum::routing::post(admin_passwd_set_admin))
-        .route("/admin/passwd/rotate", axum::routing::post(admin_passwd_rotate))
+        .route(
+            "/admin/passwd/revoke",
+            axum::routing::post(admin_passwd_revoke),
+        )
+        .route(
+            "/admin/passwd/set-admin",
+            axum::routing::post(admin_passwd_set_admin),
+        )
+        .route(
+            "/admin/passwd/rotate",
+            axum::routing::post(admin_passwd_rotate),
+        )
         .route("/my", get(my_login).post(my_view))
         .route("/url", get(shorten_form).post(shorten))
         .route("/:code", get(dispatch_code))
@@ -64,7 +77,10 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
 }
 
 async fn root() -> Html<String> {
-    Html(templates::render("index.html", context! { title => "zigi.zip" }))
+    Html(templates::render(
+        "index.html",
+        context! { title => "zigi.zip" },
+    ))
 }
 
 async fn upload_form() -> Html<String> {
@@ -157,11 +173,10 @@ async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
         .execute(&st.pool)
         .await?;
     if let Some(key) = object_key {
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE object_key = $1")
-                .bind(&key)
-                .fetch_one(&st.pool)
-                .await?;
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE object_key = $1")
+            .bind(&key)
+            .fetch_one(&st.pool)
+            .await?;
         if remaining == 0 {
             if let Err(e) = st.store.delete(&key).await {
                 // The row is already gone; a stray object is cheaper than a
@@ -184,7 +199,10 @@ struct AdminPasswdAddForm {
     is_admin: Option<String>,
 }
 
-async fn admin_passwd_add(State(st): State<AppState>, Form(form): Form<AdminPasswdAddForm>) -> Response {
+async fn admin_passwd_add(
+    State(st): State<AppState>,
+    Form(form): Form<AdminPasswdAddForm>,
+) -> Response {
     let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
         Ok(Some((_, l))) => l,
         Ok(None) => return admin_invalid_response(),
@@ -192,22 +210,46 @@ async fn admin_passwd_add(State(st): State<AppState>, Form(form): Form<AdminPass
     };
     let label = form.label.trim();
     if label.is_empty() {
-        return render_admin(&st, &form.password, &admin_label, Some("label required".into())).await;
+        return render_admin(
+            &st,
+            &form.password,
+            &admin_label,
+            Some("label required".into()),
+        )
+        .await;
     }
     let generated = form.generate.is_some();
     let new_pw = if generated {
         wordlist::two_word()
     } else if form.new_password.is_empty() {
-        return render_admin(&st, &form.password, &admin_label, Some("password required (or tick generate)".into())).await;
+        return render_admin(
+            &st,
+            &form.password,
+            &admin_label,
+            Some("password required (or tick generate)".into()),
+        )
+        .await;
     } else {
         form.new_password.clone()
     };
     if let Err(e) = passwd::add(&st.pool, label, &new_pw).await {
-        return render_admin(&st, &form.password, &admin_label, Some(format!("add failed: {e}"))).await;
+        return render_admin(
+            &st,
+            &form.password,
+            &admin_label,
+            Some(format!("add failed: {e}")),
+        )
+        .await;
     }
     if form.is_admin.is_some() {
         if let Err(e) = passwd::set_admin(&st.pool, label, true).await {
-            return render_admin(&st, &form.password, &admin_label, Some(format!("added '{label}' but promote failed: {e}"))).await;
+            return render_admin(
+                &st,
+                &form.password,
+                &admin_label,
+                Some(format!("added '{label}' but promote failed: {e}")),
+            )
+            .await;
         }
     }
     let flash = if generated {
@@ -224,7 +266,10 @@ struct AdminPasswdLabelForm {
     label: String,
 }
 
-async fn admin_passwd_revoke(State(st): State<AppState>, Form(form): Form<AdminPasswdLabelForm>) -> Response {
+async fn admin_passwd_revoke(
+    State(st): State<AppState>,
+    Form(form): Form<AdminPasswdLabelForm>,
+) -> Response {
     let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
         Ok(Some((_, l))) => l,
         Ok(None) => return admin_invalid_response(),
@@ -244,7 +289,10 @@ struct AdminPasswdSetAdminForm {
     is_admin: String,
 }
 
-async fn admin_passwd_set_admin(State(st): State<AppState>, Form(form): Form<AdminPasswdSetAdminForm>) -> Response {
+async fn admin_passwd_set_admin(
+    State(st): State<AppState>,
+    Form(form): Form<AdminPasswdSetAdminForm>,
+) -> Response {
     let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
         Ok(Some((_, l))) => l,
         Ok(None) => return admin_invalid_response(),
@@ -252,7 +300,11 @@ async fn admin_passwd_set_admin(State(st): State<AppState>, Form(form): Form<Adm
     };
     let want_admin = form.is_admin == "true";
     let flash = match passwd::set_admin(&st.pool, &form.label, want_admin).await {
-        Ok(()) => format!("{} '{}'", if want_admin { "promoted" } else { "demoted" }, form.label),
+        Ok(()) => format!(
+            "{} '{}'",
+            if want_admin { "promoted" } else { "demoted" },
+            form.label
+        ),
         Err(e) => format!("update failed: {e}"),
     };
     render_admin(&st, &form.password, &admin_label, Some(flash)).await
@@ -267,7 +319,10 @@ struct AdminPasswdRotateForm {
     generate: Option<String>,
 }
 
-async fn admin_passwd_rotate(State(st): State<AppState>, Form(form): Form<AdminPasswdRotateForm>) -> Response {
+async fn admin_passwd_rotate(
+    State(st): State<AppState>,
+    Form(form): Form<AdminPasswdRotateForm>,
+) -> Response {
     let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
         Ok(Some((_, l))) => l,
         Ok(None) => return admin_invalid_response(),
@@ -275,22 +330,44 @@ async fn admin_passwd_rotate(State(st): State<AppState>, Form(form): Form<AdminP
     };
     let label = form.label.trim();
     if label.is_empty() {
-        return render_admin(&st, &form.password, &admin_label, Some("label required".into())).await;
+        return render_admin(
+            &st,
+            &form.password,
+            &admin_label,
+            Some("label required".into()),
+        )
+        .await;
     }
     let generated = form.generate.is_some();
     let new_pw = if generated {
         wordlist::two_word()
     } else if form.new_password.is_empty() {
-        return render_admin(&st, &form.password, &admin_label, Some("new password required (or tick generate)".into())).await;
+        return render_admin(
+            &st,
+            &form.password,
+            &admin_label,
+            Some("new password required (or tick generate)".into()),
+        )
+        .await;
     } else {
         form.new_password.clone()
     };
     if let Err(e) = passwd::rotate(&st.pool, label, &new_pw).await {
-        return render_admin(&st, &form.password, &admin_label, Some(format!("rotate failed: {e}"))).await;
+        return render_admin(
+            &st,
+            &form.password,
+            &admin_label,
+            Some(format!("rotate failed: {e}")),
+        )
+        .await;
     }
     // If the admin rotated their own password, keep the page functional by
     // echoing the new plaintext into subsequent hidden form fields.
-    let echo_password = if label == admin_label { new_pw.clone() } else { form.password.clone() };
+    let echo_password = if label == admin_label {
+        new_pw.clone()
+    } else {
+        form.password.clone()
+    };
     let flash = if generated {
         format!("rotated '{label}' — new password: {new_pw}")
     } else {
@@ -307,18 +384,24 @@ fn admin_invalid_response() -> Response {
     .into_response()
 }
 
-async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: Option<String>) -> Response {
-    let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>, String)> = match sqlx::query_as(
-        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at, f.created_by_label
+async fn render_admin(
+    st: &AppState,
+    password: &str,
+    admin_label: &str,
+    flash: Option<String>,
+) -> Response {
+    let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>, String)> =
+        match sqlx::query_as(
+            "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at, f.created_by_label
          FROM files f JOIN links l ON l.id = f.link_id
          ORDER BY f.uploaded_at DESC",
-    )
-    .fetch_all(&st.pool)
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("files: {e}")),
-    };
+        )
+        .fetch_all(&st.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("files: {e}")),
+        };
 
     let pastes: Vec<(String, chrono::DateTime<chrono::Utc>, String)> = match sqlx::query_as(
         "SELECT l.short_code, p.updated_at, p.created_by_label
@@ -342,7 +425,12 @@ async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: O
         .await
         {
             Ok(v) => v,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("short_links: {e}")),
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("short_links: {e}"),
+                )
+            }
         };
 
     let files_ctx: Vec<_> = files
@@ -371,16 +459,20 @@ async fn render_admin(st: &AppState, password: &str, admin_label: &str, flash: O
         })
         .collect();
 
-    let passwords: Vec<(String, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, bool)> =
-        match sqlx::query_as(
-            "SELECT label, created_at, revoked_at, is_admin FROM passwords ORDER BY created_at DESC",
-        )
-        .fetch_all(&st.pool)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("passwords: {e}")),
-        };
+    let passwords: Vec<(
+        String,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        bool,
+    )> = match sqlx::query_as(
+        "SELECT label, created_at, revoked_at, is_admin FROM passwords ORDER BY created_at DESC",
+    )
+    .fetch_all(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("passwords: {e}")),
+    };
     let passwords_ctx: Vec<_> = passwords
         .into_iter()
         .map(|(label, created, revoked, admin)| {
@@ -424,7 +516,9 @@ async fn create_paste(State(st): State<AppState>, Form(form): Form<PasteForm>) -
 
     let (link_id, code) = match links::allocate(&st.pool, links::KIND_CODE).await {
         Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")).into_response()
+        }
     };
 
     let init = Vec::<u8>::new();
@@ -444,10 +538,7 @@ async fn create_paste(State(st): State<AppState>, Form(form): Form<PasteForm>) -
     Redirect::to(&format!("/{}", code)).into_response()
 }
 
-async fn dispatch_code(
-    State(st): State<AppState>,
-    AxPath(code): AxPath<String>,
-) -> Response {
+async fn dispatch_code(State(st): State<AppState>, AxPath(code): AxPath<String>) -> Response {
     match links::lookup(&st.pool, &code).await {
         Ok(Some((link_id, kind))) => match kind.as_str() {
             "file" => serve_file(&st, link_id).await,
@@ -500,8 +591,9 @@ async fn serve_file(st: &AppState, link_id: i64) -> Response {
     });
     let stream = ReaderStream::new(object.into_async_read());
     let body = Body::from_stream(stream);
-    let encoded = percent_encoding::utf8_percent_encode(&original_name, percent_encoding::NON_ALPHANUMERIC)
-        .to_string();
+    let encoded =
+        percent_encoding::utf8_percent_encode(&original_name, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
     let disp = format!("inline; filename*=UTF-8''{}", encoded);
     Response::builder()
         .status(StatusCode::OK)
@@ -622,7 +714,12 @@ async fn my_view(State(st): State<AppState>, Form(form): Form<MyForm>) -> Respon
     .await
     {
         Ok(v) => v,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("short_links: {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("short_links: {e}"),
+            )
+        }
     };
 
     let files_ctx: Vec<_> = files
@@ -677,7 +774,10 @@ async fn shorten(State(st): State<AppState>, Form(form): Form<ShortenForm>) -> R
         return err(StatusCode::BAD_REQUEST, "missing url".into());
     }
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return err(StatusCode::BAD_REQUEST, "url must start with http:// or https://".into());
+        return err(
+            StatusCode::BAD_REQUEST,
+            "url must start with http:// or https://".into(),
+        );
     }
 
     let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
@@ -726,15 +826,26 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
         match field.name().unwrap_or("") {
             "password" => password = Some(field.text().await.unwrap_or_default()),
             "file" => {
-                let original_name = field.file_name().map(|s| s.to_string()).unwrap_or_else(|| "file".into());
+                let original_name = field
+                    .file_name()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "file".into());
                 let content_type = field.content_type().map(|s| s.to_string());
                 // Spool to local scratch first: we need the whole body to know
                 // its SHA-256 (the object key) and its length before R2 will
                 // take it. The temp file never outlives this request.
-                let tmp = st.cfg.tmp_dir().join(format!(".tmp-{}", shortcode::generate(12)));
+                let tmp = st
+                    .cfg
+                    .tmp_dir()
+                    .join(format!(".tmp-{}", shortcode::generate(12)));
                 let mut f = match File::create(&tmp).await {
                     Ok(f) => f,
-                    Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("create tmp: {e}")),
+                    Err(e) => {
+                        return err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("create tmp: {e}"),
+                        )
+                    }
                 };
                 let mut hasher = Sha256::new();
                 while let Ok(Some(chunk)) = field.try_next().await {
