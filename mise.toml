@@ -1,12 +1,13 @@
 [tools]
-# Pinned: deploys ship a binary built on the dev machine, so the toolchain that
-# builds production should not drift with whatever rustup last installed.
+# Pinned: CI builds the binary production runs with this toolchain
+# (.github/workflows/build.yml), so it should not drift with whatever rustup
+# last installed.
 rust = { version = "1.98.1", components = "clippy,rustfmt" }
 "cargo:cargo-watch" = "latest"
 
 [env]
-# Local development config, kept outside the repo like production's
-# (~/.config/zigi-zip/production). `mise run setup` creates it.
+# Local development config, kept outside the repo since it holds secrets.
+# `mise run setup` creates it from config.example.toml.
 ZIGI_CONFIG = "{{env.HOME}}/.config/zigi-zip/development/config.toml"
 
 [tasks.setup]
@@ -22,7 +23,7 @@ if [[ ! -f "$ZIGI_CONFIG" ]]; then
         -e 's|^data_dir = .*|data_dir = "~/.local/share/zigi-zip/development"|' \
         -e 's|^base_url = .*|base_url = "http://127.0.0.1:43803"|' \
         -e 's|^bucket = .*|bucket = "zigi-zip-dev"|' \
-        deploy/config.example.toml > "$ZIGI_CONFIG")
+        config.example.toml > "$ZIGI_CONFIG")
     echo "created $ZIGI_CONFIG; fill in the [r2] credentials for a dev bucket"
 fi
 '''
@@ -42,11 +43,3 @@ run = "cargo clippy --all-targets"
 [tasks.fmt]
 description = "Format the tree"
 run = "cargo fmt"
-
-[tasks.deploy]
-description = "Build locally and deploy the binary and configuration to production"
-run = "deploy/deploy.sh"
-
-[tasks.rollback]
-description = "Swap the previously deployed binary back in (run again to undo)"
-run = "deploy/rollback.sh"
