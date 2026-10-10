@@ -1,7 +1,5 @@
 database_url = "postgres:///zigi_zip"
 listen = "127.0.0.1:43802"
-# Holds the scratch dir for in-flight uploads; blobs themselves live in R2.
-data_dir = "~/zigi-data"
 base_url = "https://zigi.zip"
 
 [r2]

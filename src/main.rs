@@ -40,8 +40,6 @@ enum Command {
     },
     /// Run database migrations
     Migrate,
-    /// Upload blobs still on local disk into R2 (idempotent, safe to re-run)
-    MigrateStorage,
 }
 
 #[derive(Subcommand)]
@@ -104,10 +102,6 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve => server::run(cfg, pool).await?,
         Command::Migrate => db::migrate(&pool).await?,
-        Command::MigrateStorage => {
-            let store = storage::Storage::new(&cfg.r2);
-            storage::migrate_local_files(&store, &cfg.legacy_files_dir()).await?;
-        }
         Command::Passwd { action } => match action {
             PasswdAction::Add {
                 label,

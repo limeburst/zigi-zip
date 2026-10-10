@@ -831,13 +831,13 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "file".into());
                 let content_type = field.content_type().map(|s| s.to_string());
-                // Spool to local scratch first: we need the whole body to know
-                // its SHA-256 (the object key) and its length before R2 will
-                // take it. The temp file never outlives this request.
-                let tmp = st
-                    .cfg
-                    .tmp_dir()
-                    .join(format!(".tmp-{}", shortcode::generate(12)));
+                // Spool to the system's temporary directory first: we need the
+                // whole body to know its SHA-256 (the object key) and its
+                // length before R2 will take it. The temp file never outlives
+                // this request, and the system clears out any that a crash
+                // leaves behind.
+                let tmp =
+                    std::env::temp_dir().join(format!("zigi-upload-{}", shortcode::generate(12)));
                 let mut f = match File::create(&tmp).await {
                     Ok(f) => f,
                     Err(e) => {

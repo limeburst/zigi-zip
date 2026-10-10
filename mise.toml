@@ -20,7 +20,6 @@ if [[ ! -f "$ZIGI_CONFIG" ]]; then
     (umask 077; sed \
         -e 's|^database_url = .*|database_url = "postgres:///zigi_zip_dev"|' \
         -e 's|^listen = .*|listen = "127.0.0.1:43803"|' \
-        -e 's|^data_dir = .*|data_dir = "~/.local/share/zigi-zip/development"|' \
         -e 's|^base_url = .*|base_url = "http://127.0.0.1:43803"|' \
         -e 's|^bucket = .*|bucket = "zigi-zip-dev"|' \
         config.example.toml > "$ZIGI_CONFIG")

@@ -1,12 +1,11 @@
 use anyhow::Result;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub database_url: String,
     pub listen: String,
-    pub data_dir: PathBuf,
     #[serde(default = "default_base_url")]
     pub base_url: String,
     pub r2: R2Config,
@@ -36,27 +35,6 @@ fn default_region() -> String {
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        let mut cfg: Config = toml::from_str(&raw)?;
-        if let Some(s) = cfg.data_dir.to_str() {
-            if let Some(rest) = s.strip_prefix("~/") {
-                if let Some(home) = std::env::var_os("HOME") {
-                    cfg.data_dir = PathBuf::from(home).join(rest);
-                }
-            }
-        }
-        std::fs::create_dir_all(cfg.tmp_dir())?;
-        Ok(cfg)
-    }
-
-    /// Scratch space for in-flight uploads. Bodies are spooled here so we can
-    /// hash them and know their length before handing them to R2; nothing in
-    /// this directory outlives the request that created it.
-    pub fn tmp_dir(&self) -> PathBuf {
-        self.data_dir.join("tmp")
-    }
-
-    /// Pre-R2 blob directory. Only the storage migration reads this.
-    pub fn legacy_files_dir(&self) -> PathBuf {
-        self.data_dir.join("files")
+        Ok(toml::from_str(&raw)?)
     }
 }

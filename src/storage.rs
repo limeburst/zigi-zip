@@ -49,10 +49,6 @@ impl Storage {
         }
     }
 
-    pub fn bucket(&self) -> &str {
-        &self.bucket
-    }
-
     /// True when an object with this key already exists in the bucket.
     pub async fn exists(&self, key: &str) -> Result<bool> {
         match self
@@ -233,78 +229,6 @@ impl Storage {
             .with_context(|| format!("delete {key}"))?;
         Ok(())
     }
-}
-
-/// One-shot backfill: push every blob still sitting in the pre-R2 files
-/// directory up to the bucket.
-///
-/// Deliberately reads the directory rather than the `files` table: blob names
-/// there are already their own content hash, i.e. exactly the R2 key. That
-/// keeps this runnable against a live server *before* the schema migration,
-/// so the bucket is fully populated by the time anything switches over.
-/// Idempotent — objects already in R2 are skipped — so a partial or
-/// interrupted pass can simply be re-run.
-pub async fn migrate_local_files(store: &Storage, legacy_dir: &Path) -> Result<()> {
-    let mut keys = Vec::new();
-    let mut dir = tokio::fs::read_dir(legacy_dir)
-        .await
-        .with_context(|| format!("reading {}", legacy_dir.display()))?;
-    while let Some(entry) = dir.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Skip in-flight temp uploads and anything not content-addressed.
-        if name.len() != 64 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-            tracing::warn!(name = %name, "skipping non-content-addressed entry");
-            continue;
-        }
-        if entry.file_type().await?.is_file() {
-            keys.push(name);
-        }
-    }
-    keys.sort();
-
-    let total = keys.len();
-    tracing::info!(total, bucket = store.bucket(), "migrating blobs to R2");
-
-    let (mut uploaded, mut skipped, mut failed) = (0u64, 0u64, 0u64);
-    let mut bytes = 0u64;
-    for (i, key) in keys.into_iter().enumerate() {
-        let n = i + 1;
-        let path = legacy_dir.join(&key);
-        let size = tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        match store.put_file_if_absent(&key, &path, None).await {
-            Ok(true) => {
-                uploaded += 1;
-                bytes += size;
-                tracing::info!(
-                    "[{n}/{total}] uploaded {key} ({:.1} MiB)",
-                    size as f64 / (1024.0 * 1024.0)
-                );
-            }
-            Ok(false) => {
-                skipped += 1;
-                tracing::info!("[{n}/{total}] already in bucket: {key}");
-            }
-            Err(e) => {
-                failed += 1;
-                tracing::error!(key = %key, ?e, "[{n}/{total}] upload failed");
-            }
-        }
-    }
-
-    tracing::info!(
-        uploaded,
-        skipped,
-        failed,
-        mib = bytes / (1024 * 1024),
-        "migration pass complete"
-    );
-    if failed > 0 {
-        anyhow::bail!("{failed} blob(s) failed to upload; re-run to retry");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
