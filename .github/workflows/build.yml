@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    # GitHub's macOS runners are Apple Silicon, matching the mac mini server.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same pinned toolchain as mise.toml; skip dev-only tools like cargo-watch.
+      - uses: jdx/mise-action@v3
+        with:
+          install_args: rust
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets
+      - run: cargo test
+      - run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zigi-zip-macos-arm64-${{ github.sha }}
+          path: target/release/zigi-zip
+          if-no-files-found: error
