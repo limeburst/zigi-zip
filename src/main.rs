@@ -21,7 +21,8 @@ mod wordlist;
     arg_required_else_help = true
 )]
 struct Cli {
-    #[arg(long, env = "ZIGI_CONFIG", default_value = "~/zigi-data/config.toml")]
+    /// The config file (see config.example.toml)
+    #[arg(long, env = "ZIGI_CONFIG")]
     config: String,
 
     #[command(subcommand)]
