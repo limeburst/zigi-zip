@@ -43,11 +43,11 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/", get(root))
         .route(
             "/file",
-            get(upload_form)
+            get(to_front)
                 .post(upload)
                 .layer(DefaultBodyLimit::disable()),
         )
-        .route("/code", get(paste_form).post(create_paste))
+        .route("/code", get(to_front).post(create_paste))
         .route("/admin", get(admin_login).post(admin_view))
         .route("/admin/delete", axum::routing::post(admin_delete))
         .route("/admin/passwd/add", axum::routing::post(admin_passwd_add))
@@ -63,8 +63,8 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
             "/admin/passwd/rotate",
             axum::routing::post(admin_passwd_rotate),
         )
-        .route("/my", get(my_login).post(my_view))
-        .route("/url", get(shorten_form).post(shorten))
+        .route("/my", get(to_front).post(my_view))
+        .route("/url", get(to_front).post(shorten))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
         .route("/:code/:rest", get(dispatch_code_with_rest))
@@ -76,25 +76,30 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-async fn root() -> Html<String> {
-    Html(templates::render(
-        "index.html",
-        context! { title => "zigi.zip" },
-    ))
+async fn root() -> Response {
+    front(StatusCode::OK, context! {})
 }
 
-async fn upload_form() -> Html<String> {
-    Html(templates::render(
-        "upload_form.html",
-        context! { title => "zigi.zip · upload" },
-    ))
+/// The old per-action pages are all on the front page now.
+async fn to_front() -> Redirect {
+    Redirect::to("/")
 }
 
-async fn paste_form() -> Html<String> {
-    Html(templates::render(
-        "paste_form.html",
-        context! { title => "zigi.zip · new paste" },
-    ))
+/// Render the front page. `extra` may carry `error`, `password` (echoed back
+/// so the next action doesn't need it retyped), a `result_*` block, or `mine`.
+fn front(status: StatusCode, extra: minijinja::Value) -> Response {
+    (
+        status,
+        Html(templates::render(
+            "index.html",
+            context! { title => "zigi.zip", ..extra },
+        )),
+    )
+        .into_response()
+}
+
+fn front_error(status: StatusCode, msg: &str, password: &str) -> Response {
+    front(status, context! { error => msg, password => password })
 }
 
 async fn admin_login() -> Html<String> {
@@ -510,7 +515,7 @@ struct PasteForm {
 async fn create_paste(State(st): State<AppState>, Form(form): Form<PasteForm>) -> Response {
     let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
         Ok(Some(v)) => v,
-        Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid password").into_response(),
+        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "invalid password", ""),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")).into_response(),
     };
 
@@ -650,13 +655,6 @@ async fn serve_redirect(st: &AppState, link_id: i64) -> Response {
     }
 }
 
-async fn my_login() -> Html<String> {
-    Html(templates::render(
-        "my_login.html",
-        context! { title => "zigi.zip · my stuff", error => "" },
-    ))
-}
-
 #[derive(Deserialize)]
 struct MyForm {
     password: String,
@@ -665,13 +663,7 @@ struct MyForm {
 async fn my_view(State(st): State<AppState>, Form(form): Form<MyForm>) -> Response {
     let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
         Ok(Some(v)) => v,
-        Ok(None) => {
-            return Html(templates::render(
-                "my_login.html",
-                context! { title => "zigi.zip · my stuff", error => "invalid password" },
-            ))
-            .into_response();
-        }
+        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "invalid password", ""),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
 
@@ -742,24 +734,18 @@ async fn my_view(State(st): State<AppState>, Form(form): Form<MyForm>) -> Respon
         })
         .collect();
 
-    Html(templates::render(
-        "my_view.html",
+    front(
+        StatusCode::OK,
         context! {
-            title => "zigi.zip · my stuff",
-            label => pw_label,
-            files => files_ctx,
-            pastes => pastes_ctx,
-            short_links => short_links_ctx,
+            password => form.password,
+            mine => context! {
+                label => pw_label,
+                files => files_ctx,
+                pastes => pastes_ctx,
+                short_links => short_links_ctx,
+            },
         },
-    ))
-    .into_response()
-}
-
-async fn shorten_form() -> Html<String> {
-    Html(templates::render(
-        "shorten_form.html",
-        context! { title => "zigi.zip · shorten" },
-    ))
+    )
 }
 
 #[derive(Deserialize)]
@@ -771,18 +757,23 @@ struct ShortenForm {
 async fn shorten(State(st): State<AppState>, Form(form): Form<ShortenForm>) -> Response {
     let url = form.url.trim().to_string();
     if url.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "missing url".into());
+        return front_error(
+            StatusCode::BAD_REQUEST,
+            "enter a URL to shorten",
+            &form.password,
+        );
     }
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return err(
+        return front_error(
             StatusCode::BAD_REQUEST,
-            "url must start with http:// or https://".into(),
+            "url must start with http:// or https://",
+            &form.password,
         );
     }
 
     let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
         Ok(Some(v)) => v,
-        Ok(None) => return err(StatusCode::UNAUTHORIZED, "invalid password".into()),
+        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "invalid password", ""),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
 
@@ -806,11 +797,16 @@ async fn shorten(State(st): State<AppState>, Form(form): Form<ShortenForm>) -> R
 
     let short_url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), code);
     let qr_svg = qr_svg(&short_url).unwrap_or_default();
-    Html(templates::render(
-        "shorten_success.html",
-        context! { title => "shortened", short_url => short_url, destination_url => url, qr_svg => qr_svg },
-    ))
-    .into_response()
+    front(
+        StatusCode::OK,
+        context! {
+            password => form.password,
+            result_kind => "short link",
+            result_url => short_url,
+            result_destination => url,
+            qr_svg => qr_svg,
+        },
+    )
 }
 
 // ---------- file upload ----------
@@ -874,7 +870,7 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
     };
     let Some((original_name, content_type)) = file_meta else {
         cleanup(&tmp_path).await;
-        return err(StatusCode::BAD_REQUEST, "missing file".into());
+        return front_error(StatusCode::BAD_REQUEST, "choose a file to upload", &pw);
     };
     let Some(tmp) = tmp_path else {
         return err(StatusCode::BAD_REQUEST, "missing file".into());
@@ -888,7 +884,7 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
         Ok(Some(v)) => v,
         Ok(None) => {
             let _ = tokio::fs::remove_file(&tmp).await;
-            return err(StatusCode::UNAUTHORIZED, "invalid password".into());
+            return front_error(StatusCode::UNAUTHORIZED, "invalid password", "");
         }
         Err(e) => {
             let _ = tokio::fs::remove_file(&tmp).await;
@@ -941,11 +937,10 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
 
     let url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), code);
     let qr_svg = qr_svg(&url).unwrap_or_default();
-    Html(templates::render(
-        "upload_success.html",
-        context! { title => "uploaded", url => url, qr_svg => qr_svg },
-    ))
-    .into_response()
+    front(
+        StatusCode::OK,
+        context! { password => pw, result_kind => "uploaded", result_url => url, qr_svg => qr_svg },
+    )
 }
 
 fn qr_svg(url: &str) -> Option<String> {

@@ -1,15 +1,118 @@
 {% extends "layout.html" %}
 {% block extra_css %}
-ul.services { list-style: none; padding: 0; }
-ul.services li { padding: 0.5rem 0; }
-ul.services a { font-weight: 600; }
+{% if mine %}body { max-width: min(1200px, 96vw); }{% endif %}
+fieldset { border: 0; padding: 0; margin: 0; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+fieldset input[type=url], fieldset input[type=file] { flex: 1 1 16rem; min-width: 0; }
+input[type=url] { padding: 0.5rem; font: inherit; border-radius: 0; }
+.row-label { font-size: 0.85rem; opacity: 0.6; margin-bottom: -0.4rem; }
+.actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.error { color: #c00; }
+.result { padding: 1rem; margin-bottom: 1rem; border: 1px solid currentColor; }
+.result p { margin: 0 0 0.5rem; }
+.qr { display: block; width: 180px; height: 180px; }
+.qr svg { width: 100%; height: 100%; }
+h2 { margin-top: 2rem; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); vertical-align: top; white-space: nowrap; }
+td.wrap { white-space: normal; word-break: break-all; }
+th { font-weight: 600; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
 {% endblock %}
 {% block body %}
 <h1>zigi.zip</h1>
-<ul class="services">
-  <li><a href="/file">/file</a> — upload a file, get a short link</li>
-  <li><a href="/code">/code</a> — live collaborative editor</li>
-  <li><a href="/url">/url</a> — shorten a URL</li>
-  <li><a href="/my">/my</a> — view your uploads</li>
-</ul>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+{% if result_url %}
+<div class="result">
+  <p>{{ result_kind }}: <a href="{{ result_url }}">{{ result_url }}</a></p>
+  {% if result_destination %}<p class="hint">→ {{ result_destination }}</p>{% endif %}
+  {% if qr_svg %}<div class="qr">{{ qr_svg | safe }}</div>{% endif %}
+</div>
+{% endif %}
+
+<form method="post" action="/file" enctype="multipart/form-data">
+  <input type="password" name="password" placeholder="password" required autocomplete="current-password" value="{{ password }}">
+
+  <div class="row-label">upload a file, get a short link</div>
+  <fieldset>
+    <input type="file" name="file" id="file">
+    <button type="submit" formaction="/file" formenctype="multipart/form-data" id="upload-btn">upload</button>
+  </fieldset>
+
+  <div class="row-label">shorten a URL</div>
+  <fieldset>
+    <input type="url" name="url" id="url" placeholder="https://..." autocomplete="off">
+    <button type="submit" formaction="/url" formenctype="application/x-www-form-urlencoded" id="shorten-btn">shorten</button>
+  </fieldset>
+
+  <div class="row-label">more</div>
+  <div class="actions">
+    <button type="submit" formaction="/code" formenctype="application/x-www-form-urlencoded">new collaborative note</button>
+    <button type="submit" formaction="/my" formenctype="application/x-www-form-urlencoded">my stuff</button>
+  </div>
+</form>
+
+{% if mine %}
+<p class="hint">signed in as <strong>{{ mine.label }}</strong></p>
+
+<h2>files ({{ mine.files | length }})</h2>
+{% if mine.files %}
+<table>
+  <thead><tr><th>code</th><th>filename</th><th>size</th><th>uploaded</th></tr></thead>
+  <tbody>
+  {% for f in mine.files %}
+    <tr>
+      <td><a href="/{{ f.code }}">{{ f.code }}</a></td>
+      <td class="wrap">{{ f.original_name }}</td>
+      <td class="num">{{ f.size_bytes }}</td>
+      <td>{{ f.uploaded_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+
+<h2>notes ({{ mine.pastes | length }})</h2>
+{% if mine.pastes %}
+<table>
+  <thead><tr><th>code</th><th>updated</th></tr></thead>
+  <tbody>
+  {% for p in mine.pastes %}
+    <tr>
+      <td><a href="/{{ p.code }}">{{ p.code }}</a></td>
+      <td>{{ p.updated_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+
+<h2>short links ({{ mine.short_links | length }})</h2>
+{% if mine.short_links %}
+<table>
+  <thead><tr><th>code</th><th>destination</th><th>created</th></tr></thead>
+  <tbody>
+  {% for s in mine.short_links %}
+    <tr>
+      <td><a href="/{{ s.code }}">{{ s.code }}</a></td>
+      <td class="wrap">{{ s.destination_url }}</td>
+      <td>{{ s.created_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="hint">none</p>{% endif %}
+{% endif %}
+
+<script>
+// Enter in the URL box shortens rather than hitting the form's first
+// button (upload); picking a file uploads it right away.
+document.getElementById('url').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') { e.preventDefault(); document.getElementById('shorten-btn').click(); }
+});
+document.getElementById('file').addEventListener('change', function () {
+  if (this.files.length) document.getElementById('upload-btn').click();
+});
+</script>
 {% endblock %}
