@@ -78,6 +78,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
             "/admin/passwd/rotate",
             axum::routing::post(admin_passwd_rotate),
         )
+        .route("/signin", get(to_front).post(sign_in))
         .route("/signout", axum::routing::post(sign_out))
         .route("/my", get(to_front).post(my_view))
         .route("/url", get(to_front).post(shorten))
@@ -105,6 +106,25 @@ async fn root(State(st): State<AppState>, headers: HeaderMap) -> Response {
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
     front(StatusCode::OK, context! { signed_in => signed_in })
+}
+
+#[derive(Deserialize)]
+struct SignInForm {
+    #[serde(default)]
+    password: String,
+}
+
+/// Just sign in: the front page's button beside the password box.
+async fn sign_in(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SignInForm>,
+) -> Response {
+    match authenticate(&st, &headers, &form.password).await {
+        Ok(Some(a)) => session::with_cookie(Redirect::to("/").into_response(), a.set_cookie),
+        Ok(None) => front_unauthorized(!form.password.is_empty()),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    }
 }
 
 async fn sign_out(State(st): State<AppState>, headers: HeaderMap) -> Response {

@@ -2,7 +2,7 @@
 {% block extra_css %}
 {% if mine %}body { max-width: min(1200px, 96vw); }{% endif %}
 fieldset { border: 0; padding: 0; margin: 0; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
-fieldset input[type=url], fieldset input[type=file] { flex: 1 1 16rem; min-width: 0; }
+fieldset input[type=password], fieldset input[type=url], fieldset input[type=file] { flex: 1 1 16rem; min-width: 0; }
 .row-label { font-size: 0.85rem; opacity: 0.6; margin-bottom: -0.4rem; }
 .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 .error { color: #c00; }
@@ -31,13 +31,16 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 {% endif %}
 
 {% if signed_in %}
-<form method="post" action="/signout" id="signout"></form>
+<form method="post" action="/signout" id="signout" style="display: none"></form>
 <p class="hint">signed in as <strong>{{ signed_in }}</strong> · <button type="submit" form="signout">sign out</button></p>
 {% endif %}
 
 <form method="post" action="/file" enctype="multipart/form-data">
   {% if not signed_in %}
-  <input type="password" name="password" placeholder="password" required autocomplete="current-password">
+  <fieldset>
+    <input type="password" name="password" id="password" placeholder="password" required autocomplete="current-password">
+    <button type="submit" formaction="/signin" formenctype="application/x-www-form-urlencoded" id="signin-btn">sign in</button>
+  </fieldset>
   {% endif %}
 
   <div class="row-label">upload a file, get a short link</div>
@@ -114,6 +117,11 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 // button (upload); picking a file uploads it right away.
 document.getElementById('url').addEventListener('keydown', function (e) {
   if (e.key === 'Enter') { e.preventDefault(); document.getElementById('shorten-btn').click(); }
+});
+// Enter in the password box signs in.
+const pw = document.getElementById('password');
+if (pw) pw.addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') { e.preventDefault(); document.getElementById('signin-btn').click(); }
 });
 document.getElementById('file').addEventListener('change', function () {
   if (this.files.length) document.getElementById('upload-btn').click();
