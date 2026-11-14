@@ -11,9 +11,10 @@ rust = { version = "1.98.1", components = "clippy,rustfmt" }
 ZIGI_CONFIG = "{{env.HOME}}/.config/zigi-zip/development/config.toml"
 
 [tasks.setup]
-description = "Create the local dev database and config (idempotent)"
+description = "Install git hooks and create the local dev database and config (idempotent)"
 run = '''
 set -euo pipefail
+git config core.hooksPath .githooks
 psql -lqt | cut -d'|' -f1 | grep -qw zigi_zip_dev || createdb zigi_zip_dev
 if [[ ! -f "$ZIGI_CONFIG" ]]; then
     mkdir -p "$(dirname "$ZIGI_CONFIG")"
