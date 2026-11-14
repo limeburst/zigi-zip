@@ -13,7 +13,7 @@ use yrs::{
         decoder::{Decode, DecoderV1},
         encoder::Encode,
     },
-    Doc, ReadTxn, StateVector, Transact, Update,
+    Doc, Map, ReadTxn, StateVector, Transact, Update,
 };
 
 /// In-memory state for one paste document, shared by all connected clients.
@@ -24,12 +24,39 @@ pub struct PasteDoc {
     pub dirty: Arc<Notify>,
 }
 
+impl PasteDoc {
+    /// Tell every connected client that the note's file list changed, by
+    /// bumping a counter in the shared doc. Clients watch it and refetch the
+    /// list from the server, which stays the only source of the list itself.
+    pub fn bump_files_rev(&self) {
+        let doc = self.awareness.doc();
+        let meta = doc.get_or_insert_map("zigi");
+        let update = {
+            let mut txn = doc.transact_mut();
+            let next = match meta.get(&txn, "files_rev") {
+                Some(yrs::Out::Any(yrs::Any::Number(n))) => n + 1.0,
+                _ => 1.0,
+            };
+            meta.insert(&mut txn, "files_rev", next);
+            txn.encode_update_v1()
+        };
+        let msg = Message::Sync(SyncMessage::Update(update)).encode_v1();
+        let _ = self.tx.send(Bytes::from(msg));
+        self.dirty.notify_one();
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Registry {
     inner: Arc<Mutex<HashMap<i64, Arc<PasteDoc>>>>,
 }
 
 impl Registry {
+    /// The note's live doc, only if some client has it open right now.
+    pub async fn get_loaded(&self, link_id: i64) -> Option<Arc<PasteDoc>> {
+        self.inner.lock().await.get(&link_id).cloned()
+    }
+
     pub async fn get_or_load(&self, pool: &PgPool, link_id: i64) -> Result<Arc<PasteDoc>> {
         let mut guard = self.inner.lock().await;
         if let Some(d) = guard.get(&link_id) {

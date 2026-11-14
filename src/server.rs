@@ -5,12 +5,13 @@ use axum::{
     http::{header, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use futures::TryStreamExt;
 #[allow(unused_imports)]
 use percent_encoding;
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::{path::PathBuf, sync::Arc};
@@ -67,6 +68,13 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/url", get(to_front).post(shorten))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
+        .route(
+            "/:code/files",
+            get(note_files)
+                .post(note_upload)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route("/:code/settings", axum::routing::post(note_settings))
         .route("/:code/:rest", get(dispatch_code_with_rest))
         .with_state(state);
 
@@ -568,8 +576,8 @@ async fn dispatch_code_with_rest(
 }
 
 async fn serve_file(st: &AppState, link_id: i64) -> Response {
-    let row: Option<(String, String, Option<String>, i64)> = match sqlx::query_as(
-        "SELECT original_name, object_key, content_type, size_bytes FROM files WHERE link_id = $1",
+    let row: Option<(String, String, Option<String>, i64, bool)> = match sqlx::query_as(
+        "SELECT original_name, object_key, content_type, size_bytes, via_link FROM files WHERE link_id = $1",
     )
     .bind(link_id)
     .fetch_optional(&st.pool)
@@ -578,7 +586,7 @@ async fn serve_file(st: &AppState, link_id: i64) -> Response {
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")).into_response(),
     };
-    let Some((original_name, object_key, content_type, size)) = row else {
+    let Some((original_name, object_key, content_type, size, via_link)) = row else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
     let object = match st.store.get(&object_key).await {
@@ -589,24 +597,34 @@ async fn serve_file(st: &AppState, link_id: i64) -> Response {
             return (StatusCode::BAD_GATEWAY, "storage unavailable").into_response();
         }
     };
-    let ct = content_type.unwrap_or_else(|| {
-        mime_guess::from_path(&original_name)
-            .first_or_octet_stream()
-            .to_string()
-    });
+    // Files that came in through a note's link without a password are only
+    // ever downloads: never rendered here, so an anonymous upload can't put a
+    // page (say, a fake password form) on this domain.
+    let ct = if via_link {
+        "application/octet-stream".to_string()
+    } else {
+        content_type.unwrap_or_else(|| {
+            mime_guess::from_path(&original_name)
+                .first_or_octet_stream()
+                .to_string()
+        })
+    };
     let stream = ReaderStream::new(object.into_async_read());
     let body = Body::from_stream(stream);
     let encoded =
         percent_encoding::utf8_percent_encode(&original_name, percent_encoding::NON_ALPHANUMERIC)
             .to_string();
-    let disp = format!("inline; filename*=UTF-8''{}", encoded);
-    Response::builder()
+    let disposition = if via_link { "attachment" } else { "inline" };
+    let disp = format!("{disposition}; filename*=UTF-8''{}", encoded);
+    let mut res = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct)
         .header(header::CONTENT_LENGTH, size)
-        .header(header::CONTENT_DISPOSITION, disp)
-        .body(body)
-        .unwrap()
+        .header(header::CONTENT_DISPOSITION, disp);
+    if via_link {
+        res = res.header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    }
+    res.body(body).unwrap()
 }
 
 async fn serve_paste_editor(st: &AppState, code: &str) -> Response {
@@ -811,129 +829,189 @@ async fn shorten(State(st): State<AppState>, Form(form): Form<ShortenForm>) -> R
 
 // ---------- file upload ----------
 
+/// A multipart file field, written out to a temp file.
+struct Spooled {
+    tmp: PathBuf,
+    content_hash: String,
+    size: i64,
+    original_name: String,
+    content_type: Option<String>,
+}
+
+enum SpoolError {
+    /// The field ran past `cap` bytes; the temp file is already gone.
+    TooLarge,
+    Io(String),
+}
+
+/// Spool a file field to the system's temporary directory: we need the whole
+/// body to know its SHA-256 (the object key) and its length before R2 will
+/// take it. The temp file never outlives the request, and the system clears
+/// out any that a crash leaves behind. With `cap`, stops as soon as the body
+/// passes that many bytes.
+async fn spool(
+    field: &mut axum::extract::multipart::Field<'_>,
+    cap: Option<i64>,
+) -> std::result::Result<Spooled, SpoolError> {
+    let original_name = field
+        .file_name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "file".into());
+    let content_type = field.content_type().map(|s| s.to_string());
+    let tmp = std::env::temp_dir().join(format!("zigi-upload-{}", shortcode::generate(12)));
+    let mut f = File::create(&tmp)
+        .await
+        .map_err(|e| SpoolError::Io(format!("create tmp: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut size: i64 = 0;
+    loop {
+        let chunk = match field.try_next().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(SpoolError::Io(format!("read: {e}")));
+            }
+        };
+        size += chunk.len() as i64;
+        if cap.is_some_and(|c| size > c) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(SpoolError::TooLarge);
+        }
+        hasher.update(&chunk);
+        if let Err(e) = f.write_all(&chunk).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(SpoolError::Io(format!("write: {e}")));
+        }
+    }
+    if let Err(e) = f.flush().await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(SpoolError::Io(format!("flush: {e}")));
+    }
+    Ok(Spooled {
+        tmp,
+        content_hash: hex::encode(hasher.finalize()),
+        size,
+        original_name,
+        content_type,
+    })
+}
+
+/// Who a stored file is filed under.
+struct Uploader {
+    by: Option<i64>,
+    label: String,
+    /// Set for files added through a note's link without a password.
+    note_link_id: Option<i64>,
+    via_link: bool,
+}
+
+/// Move a spooled file into R2 and give it a link. Returns its short code.
+/// The temp file is removed either way.
+async fn store_spooled(
+    st: &AppState,
+    s: Spooled,
+    who: &Uploader,
+) -> std::result::Result<String, (StatusCode, String)> {
+    // Content-addressed storage: the object key is the hash, so identical
+    // content always lands at the same key and dedup is a property of the
+    // key space. put_file_if_absent skips the transfer on a dedup hit.
+    let stored = st
+        .store
+        .put_file_if_absent(&s.content_hash, &s.tmp, s.content_type.as_deref())
+        .await;
+    let _ = tokio::fs::remove_file(&s.tmp).await;
+    let fresh_object = match stored {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            tracing::error!(key = %s.content_hash, ?e, "R2 upload failed");
+            return Err((StatusCode::BAD_GATEWAY, "storage upload failed".into()));
+        }
+    };
+
+    let (link_id, code) = links::allocate(&st.pool, links::KIND_FILE)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")))?;
+
+    let insert = sqlx::query(
+        "INSERT INTO files (link_id, original_name, object_key, content_type, size_bytes,
+                            uploaded_by, created_by_label, content_hash, note_link_id, via_link)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+    )
+    .bind(link_id)
+    .bind(&s.original_name)
+    .bind(&s.content_hash)
+    .bind(s.content_type.as_deref())
+    .bind(s.size)
+    .bind(who.by)
+    .bind(&who.label)
+    .bind(&s.content_hash)
+    .bind(who.note_link_id)
+    .bind(who.via_link)
+    .execute(&st.pool)
+    .await;
+    if let Err(e) = insert {
+        if fresh_object {
+            let _ = st.store.delete(&s.content_hash).await;
+        }
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("db insert: {e}")));
+    }
+    Ok(code)
+}
+
 async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
     let mut password: Option<String> = None;
-    let mut file_meta: Option<(String, Option<String>)> = None;
-    let mut tmp_path: Option<PathBuf> = None;
-    let mut content_hash: Option<String> = None;
-    let mut size: i64 = 0;
+    let mut spooled: Option<Spooled> = None;
 
     while let Ok(Some(mut field)) = mp.next_field().await {
         match field.name().unwrap_or("") {
             "password" => password = Some(field.text().await.unwrap_or_default()),
-            "file" => {
-                let original_name = field
-                    .file_name()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "file".into());
-                let content_type = field.content_type().map(|s| s.to_string());
-                // Spool to the system's temporary directory first: we need the
-                // whole body to know its SHA-256 (the object key) and its
-                // length before R2 will take it. The temp file never outlives
-                // this request, and the system clears out any that a crash
-                // leaves behind.
-                let tmp =
-                    std::env::temp_dir().join(format!("zigi-upload-{}", shortcode::generate(12)));
-                let mut f = match File::create(&tmp).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        return err(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("create tmp: {e}"),
-                        )
-                    }
-                };
-                let mut hasher = Sha256::new();
-                while let Ok(Some(chunk)) = field.try_next().await {
-                    size += chunk.len() as i64;
-                    hasher.update(&chunk);
-                    if let Err(e) = f.write_all(&chunk).await {
-                        let _ = tokio::fs::remove_file(&tmp).await;
-                        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"));
+            "file" => match spool(&mut field, None).await {
+                Ok(s) => {
+                    if let Some(old) = spooled.replace(s) {
+                        let _ = tokio::fs::remove_file(&old.tmp).await;
                     }
                 }
-                if let Err(e) = f.flush().await {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return err(StatusCode::INTERNAL_SERVER_ERROR, format!("flush: {e}"));
+                Err(SpoolError::Io(m)) => {
+                    discard(&spooled).await;
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, m);
                 }
-                tmp_path = Some(tmp);
-                file_meta = Some((original_name, content_type));
-                content_hash = Some(hex::encode(hasher.finalize()));
-            }
+                Err(SpoolError::TooLarge) => unreachable!("no cap"),
+            },
             _ => {}
         }
     }
 
     let Some(pw) = password else {
-        cleanup(&tmp_path).await;
+        discard(&spooled).await;
         return err(StatusCode::BAD_REQUEST, "missing password".into());
     };
-    let Some((original_name, content_type)) = file_meta else {
-        cleanup(&tmp_path).await;
+    let Some(s) = spooled else {
         return front_error(StatusCode::BAD_REQUEST, "choose a file to upload", &pw);
-    };
-    let Some(tmp) = tmp_path else {
-        return err(StatusCode::BAD_REQUEST, "missing file".into());
-    };
-    let Some(content_hash) = content_hash else {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return err(StatusCode::BAD_REQUEST, "missing file".into());
     };
 
     let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &pw).await {
         Ok(Some(v)) => v,
         Ok(None) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = tokio::fs::remove_file(&s.tmp).await;
             return front_error(StatusCode::UNAUTHORIZED, "invalid password", "");
         }
         Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = tokio::fs::remove_file(&s.tmp).await;
             return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}"));
         }
     };
 
-    // Content-addressed storage: the object key is the hash, so identical
-    // content always lands at the same key and dedup is a property of the
-    // key space. put_file_if_absent skips the transfer on a dedup hit.
-    let fresh_object = match st
-        .store
-        .put_file_if_absent(&content_hash, &tmp, content_type.as_deref())
-        .await
-    {
-        Ok(fresh) => fresh,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            tracing::error!(key = %content_hash, ?e, "R2 upload failed");
-            return err(StatusCode::BAD_GATEWAY, "storage upload failed".into());
-        }
+    let who = Uploader {
+        by: Some(pw_id),
+        label: pw_label,
+        note_link_id: None,
+        via_link: false,
     };
-    let _ = tokio::fs::remove_file(&tmp).await;
-
-    let (link_id, code) = match links::allocate(&st.pool, links::KIND_FILE).await {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")),
+    let code = match store_spooled(&st, s, &who).await {
+        Ok(c) => c,
+        Err((status, msg)) => return err(status, msg),
     };
-
-    let insert = sqlx::query(
-        "INSERT INTO files (link_id, original_name, object_key, content_type, size_bytes, uploaded_by, created_by_label, content_hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-    )
-    .bind(link_id)
-    .bind(&original_name)
-    .bind(&content_hash)
-    .bind(content_type.as_deref())
-    .bind(size)
-    .bind(pw_id)
-    .bind(&pw_label)
-    .bind(&content_hash)
-    .execute(&st.pool)
-    .await;
-    if let Err(e) = insert {
-        if fresh_object {
-            let _ = st.store.delete(&content_hash).await;
-        }
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db insert: {e}"));
-    }
 
     let url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), code);
     let qr_svg = qr_svg(&url).unwrap_or_default();
@@ -943,6 +1021,241 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
     )
 }
 
+async fn discard(s: &Option<Spooled>) {
+    if let Some(s) = s {
+        let _ = tokio::fs::remove_file(&s.tmp).await;
+    }
+}
+
+// ---------- files in a note ----------
+
+/// Per-file cap on uploads made through a note's link without a password.
+const LINK_UPLOAD_MAX_FILE: i64 = 25 * 1024 * 1024;
+/// Cap on everything uploaded that way into one note.
+const LINK_UPLOAD_MAX_TOTAL: i64 = 500 * 1024 * 1024;
+
+struct Note {
+    link_id: i64,
+    owner: Option<i64>,
+    owner_label: String,
+    open_uploads: bool,
+}
+
+async fn note_by_code(pool: &PgPool, code: &str) -> anyhow::Result<Option<Note>> {
+    let row: Option<(i64, Option<i64>, String, bool)> = sqlx::query_as(
+        "SELECT p.link_id, p.created_by, p.created_by_label, p.open_uploads
+         FROM pastes p JOIN links l ON l.id = p.link_id
+         WHERE l.short_code = $1 AND l.kind = 'code'",
+    )
+    .bind(code)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(link_id, owner, owner_label, open_uploads)| Note {
+        link_id,
+        owner,
+        owner_label,
+        open_uploads,
+    }))
+}
+
+fn json_err(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, Json(json!({ "error": msg.into() }))).into_response()
+}
+
+/// Tell the note's open editors to reload its file list.
+async fn notify_files_changed(st: &AppState, note_link_id: i64) {
+    if let Some(doc) = st.pastes.get_loaded(note_link_id).await {
+        doc.bump_files_rev();
+    }
+}
+
+async fn note_files(State(st): State<AppState>, AxPath(code): AxPath<String>) -> Response {
+    let note = match note_by_code(&st.pool, &code).await {
+        Ok(Some(n)) => n,
+        // Not a note: this is a file link with a name after it, as before.
+        Ok(None) => return dispatch_code(State(st), AxPath(code)).await,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
+    };
+    let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
+        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at
+         FROM files f JOIN links l ON l.id = f.link_id
+         WHERE f.note_link_id = $1
+         ORDER BY f.uploaded_at",
+    )
+    .bind(note.link_id)
+    .fetch_all(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("files: {e}")),
+    };
+    let files: Vec<_> = files
+        .into_iter()
+        .map(|(code, name, size, at)| {
+            json!({ "code": code, "name": name, "size": size, "uploaded_at": at.to_rfc3339() })
+        })
+        .collect();
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "open_uploads": note.open_uploads,
+            "max_file": LINK_UPLOAD_MAX_FILE,
+            "files": files,
+        })),
+    )
+        .into_response()
+}
+
+/// Upload one file into a note. With a valid password the file is filed
+/// under that password, as on the front page. Without one, the note's owner
+/// must have opened uploads to link holders; the file is then filed under the
+/// owner, capped in size, and only ever served as a download.
+async fn note_upload(
+    State(st): State<AppState>,
+    AxPath(code): AxPath<String>,
+    mut mp: Multipart,
+) -> Response {
+    let note = match note_by_code(&st.pool, &code).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return json_err(StatusCode::NOT_FOUND, "not found"),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
+    };
+
+    let mut password = String::new();
+    while let Ok(Some(mut field)) = mp.next_field().await {
+        match field.name().unwrap_or("") {
+            // The page sends the password ahead of the file, so we know whose
+            // upload this is (and its cap) before taking any bytes.
+            "password" => password = field.text().await.unwrap_or_default(),
+            "file" => {
+                let who = if !password.is_empty() {
+                    match passwd::verify_password(&st.pool, &password).await {
+                        Ok(Some((id, label))) => Uploader {
+                            by: Some(id),
+                            label,
+                            note_link_id: Some(note.link_id),
+                            via_link: false,
+                        },
+                        Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "invalid password"),
+                        Err(e) => {
+                            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}"))
+                        }
+                    }
+                } else if note.open_uploads {
+                    Uploader {
+                        by: note.owner,
+                        label: format!("{} (via {})", note.owner_label, code),
+                        note_link_id: Some(note.link_id),
+                        via_link: true,
+                    }
+                } else {
+                    return json_err(
+                        StatusCode::UNAUTHORIZED,
+                        "enter your zigi.zip password to upload here",
+                    );
+                };
+
+                let cap = if who.via_link {
+                    let used: i64 = match sqlx::query_scalar(
+                        "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM files
+                         WHERE note_link_id = $1 AND via_link",
+                    )
+                    .bind(note.link_id)
+                    .fetch_one(&st.pool)
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}"))
+                        }
+                    };
+                    let left = LINK_UPLOAD_MAX_TOTAL - used;
+                    if left <= 0 {
+                        return json_err(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "this note is full for uploads without a password (500 MB)",
+                        );
+                    }
+                    Some(LINK_UPLOAD_MAX_FILE.min(left))
+                } else {
+                    None
+                };
+
+                let s = match spool(&mut field, cap).await {
+                    Ok(s) => s,
+                    Err(SpoolError::TooLarge) => {
+                        return json_err(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "too large: without a password, files are capped at 25 MB each and 500 MB per note",
+                        )
+                    }
+                    Err(SpoolError::Io(m)) => {
+                        return json_err(StatusCode::INTERNAL_SERVER_ERROR, m)
+                    }
+                };
+                let (name, size) = (s.original_name.clone(), s.size);
+                let file_code = match store_spooled(&st, s, &who).await {
+                    Ok(c) => c,
+                    Err((status, msg)) => return json_err(status, msg),
+                };
+                notify_files_changed(&st, note.link_id).await;
+                let url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), file_code);
+                return Json(json!({ "code": file_code, "url": url, "name": name, "size": size }))
+                    .into_response();
+            }
+            _ => {}
+        }
+    }
+    json_err(StatusCode::BAD_REQUEST, "choose a file to upload")
+}
+
+#[derive(Deserialize)]
+struct NoteSettingsForm {
+    password: String,
+    open_uploads: String,
+}
+
+/// Owner-only: open or close uploads without a password. An admin password
+/// works too.
+async fn note_settings(
+    State(st): State<AppState>,
+    AxPath(code): AxPath<String>,
+    Form(form): Form<NoteSettingsForm>,
+) -> Response {
+    let note = match note_by_code(&st.pool, &code).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return json_err(StatusCode::NOT_FOUND, "not found"),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
+    };
+    let is_owner = match passwd::verify_password(&st.pool, &form.password).await {
+        Ok(Some((id, _))) => note.owner == Some(id),
+        Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "invalid password"),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let allowed = is_owner
+        || matches!(
+            passwd::verify_admin(&st.pool, &form.password).await,
+            Ok(Some(_))
+        );
+    if !allowed {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            "only the note's owner can change this",
+        );
+    }
+    let open = form.open_uploads == "true";
+    if let Err(e) = sqlx::query("UPDATE pastes SET open_uploads = $1 WHERE link_id = $2")
+        .bind(open)
+        .bind(note.link_id)
+        .execute(&st.pool)
+        .await
+    {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("update: {e}"));
+    }
+    notify_files_changed(&st, note.link_id).await;
+    Json(json!({ "open_uploads": open })).into_response()
+}
+
 fn qr_svg(url: &str) -> Option<String> {
     let qr = qrcode::QrCode::new(url).ok()?;
     Some(
@@ -950,12 +1263,6 @@ fn qr_svg(url: &str) -> Option<String> {
             .quiet_zone(true)
             .build(),
     )
-}
-
-async fn cleanup(tmp: &Option<PathBuf>) {
-    if let Some(p) = tmp {
-        let _ = tokio::fs::remove_file(p).await;
-    }
 }
 
 fn err(code: StatusCode, msg: String) -> Response {
