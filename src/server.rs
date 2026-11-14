@@ -7,7 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 #[allow(unused_imports)]
 use percent_encoding;
 use serde::Deserialize;
@@ -21,7 +21,8 @@ use tokio_util::io::ReaderStream;
 use minijinja::context;
 
 use crate::{
-    config::Config, links, passwd, paste, shortcode, storage::Storage, templates, wordlist,
+    cache::DiskCache, config::Config, links, passwd, paste, shortcode, storage::Storage, templates,
+    wordlist,
 };
 
 #[derive(Clone)]
@@ -30,11 +31,23 @@ struct AppState {
     pool: PgPool,
     pastes: paste::Registry,
     store: Storage,
+    /// Local copies of recently uploaded and served files; None when off.
+    cache: Option<DiskCache>,
 }
 
 pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
     crate::db::migrate(&pool).await?;
+    let cache = match &cfg.cache {
+        Some(c) => {
+            let cache = DiskCache::open(c).await?;
+            let u = cache.usage();
+            tracing::info!(dir = %c.dir.display(), files = u.files, bytes = u.bytes, max_bytes = u.max_bytes, "disk cache on");
+            Some(cache)
+        }
+        None => None,
+    };
     let state = AppState {
+        cache,
         store: Storage::new(&cfg.r2),
         cfg: Arc::new(cfg.clone()),
         pool,
@@ -51,6 +64,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/code", get(to_front).post(create_paste))
         .route("/admin", get(admin_login).post(admin_view))
         .route("/admin/delete", axum::routing::post(admin_delete))
+        .route("/admin/cache/clear", axum::routing::post(admin_cache_clear))
         .route("/admin/passwd/add", axum::routing::post(admin_passwd_add))
         .route(
             "/admin/passwd/revoke",
@@ -162,6 +176,27 @@ async fn admin_delete(State(st): State<AppState>, Form(form): Form<AdminDeleteFo
     render_admin(&st, &form.password, &admin_label, Some(msg)).await
 }
 
+async fn admin_cache_clear(State(st): State<AppState>, Form(form): Form<AdminForm>) -> Response {
+    let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some((_, l))) => l,
+        Ok(None) => return admin_invalid_response(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let msg = match &st.cache {
+        Some(cache) => {
+            let (files, bytes) = cache.clear().await;
+            format!("cleared the disk cache: {files} files, {}", mb(bytes))
+        }
+        None => "the disk cache is off".to_string(),
+    };
+    render_admin(&st, &form.password, &admin_label, Some(msg)).await
+}
+
+/// Bytes as megabytes with one decimal, for the admin page.
+fn mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 /// Delete the link with `code` and — for file links — remove the R2 object
 /// only when no other links still reference that `object_key`.
 async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
@@ -191,6 +226,9 @@ async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
             .fetch_one(&st.pool)
             .await?;
         if remaining == 0 {
+            if let Some(cache) = &st.cache {
+                cache.remove(&key).await;
+            }
             if let Err(e) = st.store.delete(&key).await {
                 // The row is already gone; a stray object is cheaper than a
                 // failed admin action, so log it rather than erroring out.
@@ -510,6 +548,14 @@ async fn render_admin(
             pastes => pastes_ctx,
             short_links => short_links_ctx,
             passwords => passwords_ctx,
+            cache => st.cache.as_ref().map(|c| {
+                let u = c.usage();
+                context! {
+                    files => u.files,
+                    used_mb => format!("{:.1}", u.bytes as f64 / (1024.0 * 1024.0)),
+                    max_mb => u.max_bytes / (1024 * 1024),
+                }
+            }),
         },
     ))
     .into_response()
@@ -589,13 +635,9 @@ async fn serve_file(st: &AppState, link_id: i64) -> Response {
     let Some((original_name, object_key, content_type, size, via_link)) = row else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    let object = match st.store.get(&object_key).await {
-        Ok(Some(b)) => b,
-        Ok(None) => return (StatusCode::NOT_FOUND, "file missing in storage").into_response(),
-        Err(e) => {
-            tracing::error!(key = %object_key, ?e, "R2 get failed");
-            return (StatusCode::BAD_GATEWAY, "storage unavailable").into_response();
-        }
+    let body = match file_body(st, &object_key, size).await {
+        Ok(b) => b,
+        Err(res) => return res,
     };
     // Files that came in through a note's link without a password are only
     // ever downloads: never rendered here, so an anonymous upload can't put a
@@ -609,8 +651,6 @@ async fn serve_file(st: &AppState, link_id: i64) -> Response {
                 .to_string()
         })
     };
-    let stream = ReaderStream::new(object.into_async_read());
-    let body = Body::from_stream(stream);
     let encoded =
         percent_encoding::utf8_percent_encode(&original_name, percent_encoding::NON_ALPHANUMERIC)
             .to_string();
@@ -625,6 +665,67 @@ async fn serve_file(st: &AppState, link_id: i64) -> Response {
         res = res.header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     }
     res.body(body).unwrap()
+}
+
+/// A file's bytes: from the disk cache when it has them, else from R2 --
+/// keeping a copy in the cache as they stream past, for the next request.
+async fn file_body(st: &AppState, key: &str, size: i64) -> Result<Body, Response> {
+    if let Some(cache) = &st.cache {
+        if let Some(f) = cache.get(key).await {
+            return Ok(Body::from_stream(ReaderStream::new(f)));
+        }
+    }
+    let object = match st.store.get(key).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return Err((StatusCode::NOT_FOUND, "file missing in storage").into_response())
+        }
+        Err(e) => {
+            tracing::error!(key = %key, ?e, "R2 get failed");
+            return Err((StatusCode::BAD_GATEWAY, "storage unavailable").into_response());
+        }
+    };
+    let stream = ReaderStream::new(object.into_async_read());
+    let fill = match &st.cache {
+        Some(c) => c.start_fill(key, size.max(0) as u64).await,
+        None => None,
+    };
+    let Some(fill) = fill else {
+        return Ok(Body::from_stream(stream));
+    };
+    // Copy each chunk into the cache on its way out. The copy is kept once
+    // every byte has passed (checked against the hash); if the client goes
+    // away first, the stream is dropped and so is the partial copy.
+    let teed = futures::stream::unfold(
+        (stream, Some(fill)),
+        |(mut stream, mut fill)| async move {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if let Some(f) = fill.as_mut() {
+                        if f.write(&chunk).await.is_err() {
+                            fill = None;
+                        }
+                    }
+                    // Finish as soon as the last byte is in: with a known
+                    // Content-Length the server may stop polling right after it.
+                    if fill.as_ref().is_some_and(|f| f.complete()) {
+                        if let Some(f) = fill.take() {
+                            f.finish().await;
+                        }
+                    }
+                    Some((Ok::<_, std::io::Error>(chunk), (stream, fill)))
+                }
+                Some(Err(e)) => Some((Err(e), (stream, None))),
+                None => {
+                    if let Some(f) = fill {
+                        f.finish().await;
+                    }
+                    None
+                }
+            }
+        },
+    );
+    Ok(Body::from_stream(teed))
 }
 
 async fn serve_paste_editor(st: &AppState, code: &str) -> Response {
@@ -844,13 +945,23 @@ enum SpoolError {
     Io(String),
 }
 
-/// Spool a file field to the system's temporary directory: we need the whole
-/// body to know its SHA-256 (the object key) and its length before R2 will
-/// take it. The temp file never outlives the request, and the system clears
-/// out any that a crash leaves behind. With `cap`, stops as soon as the body
-/// passes that many bytes.
+/// Where to spool an upload: into the disk cache's directory when it's on,
+/// so keeping the file afterwards is a rename; else the system's temporary
+/// directory, which also clears out any that a crash leaves behind.
+fn spool_path(st: &AppState) -> PathBuf {
+    match &st.cache {
+        Some(c) => c.spool_path(),
+        None => std::env::temp_dir().join(format!("zigi-upload-{}", shortcode::generate(12))),
+    }
+}
+
+/// Spool a file field to `tmp`: we need the whole body to know its SHA-256
+/// (the object key) and its length before R2 will take it. The temp file never
+/// outlives the request. With `cap`, stops as soon as the body passes that
+/// many bytes.
 async fn spool(
     field: &mut axum::extract::multipart::Field<'_>,
+    tmp: PathBuf,
     cap: Option<i64>,
 ) -> std::result::Result<Spooled, SpoolError> {
     let original_name = field
@@ -858,7 +969,6 @@ async fn spool(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "file".into());
     let content_type = field.content_type().map(|s| s.to_string());
-    let tmp = std::env::temp_dir().join(format!("zigi-upload-{}", shortcode::generate(12)));
     let mut f = File::create(&tmp)
         .await
         .map_err(|e| SpoolError::Io(format!("create tmp: {e}")))?;
@@ -907,7 +1017,7 @@ struct Uploader {
 }
 
 /// Move a spooled file into R2 and give it a link. Returns its short code.
-/// The temp file is removed either way.
+/// The temp file is kept in the disk cache when that's on, else removed.
 async fn store_spooled(
     st: &AppState,
     s: Spooled,
@@ -920,7 +1030,13 @@ async fn store_spooled(
         .store
         .put_file_if_absent(&s.content_hash, &s.tmp, s.content_type.as_deref())
         .await;
-    let _ = tokio::fs::remove_file(&s.tmp).await;
+    match (&stored, &st.cache) {
+        // Just uploaded, so likely about to be fetched: keep a local copy.
+        (Ok(_), Some(cache)) => cache.adopt(&s.content_hash, &s.tmp).await,
+        _ => {
+            let _ = tokio::fs::remove_file(&s.tmp).await;
+        }
+    }
     let fresh_object = match stored {
         Ok(fresh) => fresh,
         Err(e) => {
@@ -953,6 +1069,9 @@ async fn store_spooled(
     if let Err(e) = insert {
         if fresh_object {
             let _ = st.store.delete(&s.content_hash).await;
+            if let Some(cache) = &st.cache {
+                cache.remove(&s.content_hash).await;
+            }
         }
         return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("db insert: {e}")));
     }
@@ -966,7 +1085,7 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
     while let Ok(Some(mut field)) = mp.next_field().await {
         match field.name().unwrap_or("") {
             "password" => password = Some(field.text().await.unwrap_or_default()),
-            "file" => match spool(&mut field, None).await {
+            "file" => match spool(&mut field, spool_path(&st), None).await {
                 Ok(s) => {
                     if let Some(old) = spooled.replace(s) {
                         let _ = tokio::fs::remove_file(&old.tmp).await;
@@ -1181,7 +1300,7 @@ async fn note_upload(
                     None
                 };
 
-                let s = match spool(&mut field, cap).await {
+                let s = match spool(&mut field, spool_path(&st), cap).await {
                     Ok(s) => s,
                     Err(SpoolError::TooLarge) => {
                         return json_err(

@@ -7,3 +7,10 @@ endpoint = "https://<account-id>.r2.cloudflarestorage.com"
 bucket = "zigi-zip"
 access_key_id = "<r2-access-key-id>"
 secret_access_key = "<r2-secret-access-key>"
+
+# Optional: keep recently uploaded and served files on local disk, so serving
+# them doesn't need a trip to R2. Leave this section out to turn it off.
+[cache]
+dir = "~/.cache/zigi-zip"
+max_size_mb = 1024   # total; the least recently used files are dropped first
+max_file_mb = 100    # larger files are always served from R2

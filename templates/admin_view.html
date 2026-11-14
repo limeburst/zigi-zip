@@ -89,6 +89,15 @@ form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
 </table>
 {% else %}<p class="hint">none</p>{% endif %}
 
+<h2>disk cache</h2>
+{% if cache %}
+<p>{{ cache.files }} files, {{ cache.used_mb }} of {{ cache.max_mb }} MB</p>
+<form class="inline" method="post" action="/admin/cache/clear" onsubmit="return confirm('clear the disk cache? files are then fetched from R2 again.')">
+  <input type="hidden" name="password" value="{{ password }}">
+  <button type="submit">clear cache</button>
+</form>
+{% else %}<p class="hint">off (no [cache] section in the config)</p>{% endif %}
+
 <h2>passwords ({{ passwords | length }})</h2>
 <table>
   <thead><tr><th>label</th><th>created</th><th>revoked</th><th>admin</th><th></th></tr></thead>

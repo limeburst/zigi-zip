@@ -22,6 +22,7 @@ if [[ ! -f "$ZIGI_CONFIG" ]]; then
         -e 's|^listen = .*|listen = "127.0.0.1:43803"|' \
         -e 's|^base_url = .*|base_url = "http://127.0.0.1:43803"|' \
         -e 's|^bucket = .*|bucket = "zigi-zip-dev"|' \
+        -e 's|^dir = "~/.cache/zigi-zip"|dir = "~/.cache/zigi-zip-dev"|' \
         config.example.toml > "$ZIGI_CONFIG")
     echo "created $ZIGI_CONFIG; fill in the [r2] credentials for a dev bucket"
 fi
