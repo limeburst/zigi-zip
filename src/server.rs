@@ -1520,7 +1520,7 @@ async fn note_upload_inner(
     mut mp: Multipart,
     set_cookie: &mut Option<String>,
 ) -> Response {
-    let note = match note_by_code(&st.pool, &code).await {
+    let note = match note_by_code(&st.pool, code).await {
         Ok(Some(n)) => n,
         Ok(None) => return json_err(StatusCode::NOT_FOUND, "not found"),
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
@@ -1533,7 +1533,7 @@ async fn note_upload_inner(
             // upload this is (and its cap) before taking any bytes.
             "password" => password = field.text().await.unwrap_or_default(),
             "file" => {
-                let auth = match authenticate(&st, headers, &password).await {
+                let auth = match authenticate(st, headers, &password).await {
                     Ok(a) => a,
                     Err(e) => {
                         return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}"))
@@ -1589,7 +1589,7 @@ async fn note_upload_inner(
                     None
                 };
 
-                let s = match spool(&mut field, spool_path(&st), cap).await {
+                let s = match spool(&mut field, spool_path(st), cap).await {
                     Ok(s) => s,
                     Err(SpoolError::TooLarge) => {
                         return json_err(
@@ -1602,11 +1602,11 @@ async fn note_upload_inner(
                     }
                 };
                 let (name, size) = (s.original_name.clone(), s.size);
-                let file_code = match store_spooled(&st, s, &who).await {
+                let file_code = match store_spooled(st, s, &who).await {
                     Ok(c) => c,
                     Err((status, msg)) => return json_err(status, msg),
                 };
-                notify_files_changed(&st, note.link_id).await;
+                notify_files_changed(st, note.link_id).await;
                 let url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), file_code);
                 return Json(json!({ "code": file_code, "url": url, "name": name, "size": size }))
                     .into_response();
