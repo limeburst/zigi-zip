@@ -83,6 +83,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/signin", get(to_front).post(sign_in))
         .route("/signout", axum::routing::post(sign_out))
         .route("/my", get(my_view).post(my_post))
+        .route("/my/delete", axum::routing::post(my_delete))
         .route("/url", get(to_front).post(shorten))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
@@ -893,6 +894,8 @@ struct MyQuery {
     tab: Option<String>,
     // Kept as text so a mangled page number falls back to page 1.
     page: Option<String>,
+    /// Set after a delete, to say what went.
+    deleted: Option<String>,
 }
 
 /// Rows per page on /my.
@@ -923,10 +926,69 @@ async fn my_view(
     match my_stuff(&st.pool, me.id, tab, page).await {
         Ok(mine) => front(
             StatusCode::OK,
-            context! { signed_in => me.label, mine => mine },
+            context! { signed_in => me.label, mine => mine, deleted => q.deleted },
         ),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("my stuff: {e}")),
     }
+}
+
+#[derive(Deserialize)]
+struct MyDeleteForm {
+    code: String,
+    #[serde(default)]
+    tab: String,
+    #[serde(default)]
+    page: String,
+}
+
+/// Delete one of the signed-in user's own files, notes or short links, then
+/// go back to the same tab and page of /my.
+async fn my_delete(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<MyDeleteForm>,
+) -> Response {
+    let me = match session::current(&st.pool, &headers).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "sign in to delete things"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    // Only what's filed under this password; for a file, also the note it
+    // shows up in, so that note's open editors can drop it from their list.
+    let owned: Option<(i64, Option<i64>)> = match sqlx::query_as(
+        "SELECT l.id, f.note_link_id
+         FROM links l LEFT JOIN files f ON f.link_id = l.id
+         WHERE l.short_code = $1 AND (
+           f.uploaded_by = $2
+           OR EXISTS (SELECT 1 FROM pastes p WHERE p.link_id = l.id AND p.created_by = $2)
+           OR EXISTS (SELECT 1 FROM short_links s WHERE s.link_id = l.id AND s.created_by = $2))",
+    )
+    .bind(&form.code)
+    .bind(me.id)
+    .fetch_optional(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
+    };
+    let Some((_, note_link_id)) = owned else {
+        return front_error(StatusCode::NOT_FOUND, "nothing of yours with that code");
+    };
+    if let Err(e) = delete_link(&st, &form.code).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}"));
+    }
+    if let Some(note) = note_link_id {
+        notify_files_changed(&st, note).await;
+    }
+    let tab = match form.tab.as_str() {
+        "notes" | "links" => form.tab.as_str(),
+        _ => "files",
+    };
+    let page = form.page.parse::<i64>().unwrap_or(1).max(1);
+    // The code is from our own alphabet, but encode it anyway: it goes in a URL.
+    let deleted =
+        percent_encoding::utf8_percent_encode(&form.code, percent_encoding::NON_ALPHANUMERIC);
+    Redirect::to(&format!("/my?tab={tab}&page={page}&deleted={deleted}")).into_response()
 }
 
 type At = chrono::DateTime<chrono::Utc>;

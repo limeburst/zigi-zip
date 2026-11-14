@@ -20,6 +20,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .tabs a { padding: 0.5rem 0.75rem; text-decoration: none; color: inherit; opacity: 0.6; border-bottom: 2px solid transparent; margin-bottom: -1px; }
 .tabs a[aria-current] { opacity: 1; font-weight: 600; border-bottom-color: currentColor; }
 .tabs .count { font-weight: 400; opacity: 0.7; font-size: 0.85rem; }
+form.inline { display: inline; margin: 0; padding: 0; border: 0; }
+form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
+td.act { text-align: right; }
 .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
 h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25rem; }
 .scroll { overflow-x: auto; }
@@ -72,6 +75,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 
 {% if mine %}
 {% macro at(t) %}<time datetime="{{ t.iso }}" title="{{ t.text }}">{{ t.text }}</time>{% endmacro %}
+{% if deleted %}<p class="hint" role="status">deleted {{ deleted }}</p>{% endif %}
 <nav class="tabs" aria-label="my stuff">
   <a href="/my?tab=files"{% if mine.tab == "files" %} aria-current="page"{% endif %}>files <span class="count">{{ mine.counts.files }}</span></a>
   <a href="/my?tab=notes"{% if mine.tab == "notes" %} aria-current="page"{% endif %}>notes <span class="count">{{ mine.counts.notes }}</span></a>
@@ -82,7 +86,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 {% if mine.rows %}
 <p class="hint">{{ mine.counts.files }} files · {{ mine.files_total }} in all</p>
 <div class="scroll"><table>
-  <thead><tr><th>filename</th><th>code</th><th class="num">size</th><th>uploaded</th><th>in note</th></tr></thead>
+  <thead><tr><th>filename</th><th>code</th><th class="num">size</th><th>uploaded</th><th>in note</th><th></th></tr></thead>
   <tbody>
   {% for f in mine.rows %}
     <tr>
@@ -91,6 +95,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
       <td class="num">{{ f.size }}</td>
       <td>{{ at(f.at) }}</td>
       <td>{% if f.note %}<a href="/{{ f.note }}">{{ f.note }}</a>{% endif %}</td>
+      <td class="act"><form class="inline" method="post" action="/my/delete" data-confirm="delete {{ f.name }} ({{ f.code }})? its link stops working. this can't be undone."><input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>
   {% endfor %}
   </tbody>
@@ -100,7 +105,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 {% elif mine.tab == "notes" %}
 {% if mine.rows %}
 <div class="scroll"><table>
-  <thead><tr><th>code</th><th class="num">files</th><th>last edited</th><th>created</th></tr></thead>
+  <thead><tr><th>code</th><th class="num">files</th><th>last edited</th><th>created</th><th></th></tr></thead>
   <tbody>
   {% for n in mine.rows %}
     <tr>
@@ -108,6 +113,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
       <td class="num">{{ n.files or "" }}</td>
       <td>{{ at(n.updated) }}</td>
       <td>{{ at(n.created) }}</td>
+      <td class="act"><form class="inline" method="post" action="/my/delete" data-confirm="delete note {{ n.code }} and its text? files in it are kept. this can't be undone."><input type="hidden" name="code" value="{{ n.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>
   {% endfor %}
   </tbody>
@@ -117,13 +123,14 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 {% else %}
 {% if mine.rows %}
 <div class="scroll"><table>
-  <thead><tr><th>code</th><th>goes to</th><th>created</th></tr></thead>
+  <thead><tr><th>code</th><th>goes to</th><th>created</th><th></th></tr></thead>
   <tbody>
   {% for s in mine.rows %}
     <tr>
       <td><a href="/{{ s.code }}">{{ s.code }}</a></td>
       <td class="wrap"><a href="{{ s.destination }}" rel="noopener noreferrer">{{ s.destination }}</a></td>
       <td>{{ at(s.at) }}</td>
+      <td class="act"><form class="inline" method="post" action="/my/delete" data-confirm="delete short link {{ s.code }}? it stops redirecting. this can't be undone."><input type="hidden" name="code" value="{{ s.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>
   {% endfor %}
   </tbody>
@@ -153,6 +160,12 @@ if (pw) pw.addEventListener('keydown', function (e) {
 });
 document.getElementById('file').addEventListener('change', function () {
   if (this.files.length) document.getElementById('upload-btn').click();
+});
+// Deletes ask first; the question names what goes.
+document.querySelectorAll('form[data-confirm]').forEach(function (f) {
+  f.addEventListener('submit', function (e) {
+    if (!confirm(f.dataset.confirm)) e.preventDefault();
+  });
 });
 // Times arrive in UTC; show them in the viewer's own time zone.
 const pad = (n) => String(n).padStart(2, '0');
