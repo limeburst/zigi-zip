@@ -127,7 +127,13 @@ pub async fn handle_ws(mut ws: WebSocket, paste: Arc<PasteDoc>) {
                     Ok(bytes) => {
                         if ws.send(WsMessage::Binary(bytes.to_vec())).await.is_err() { break; }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A lagged receiver has silently lost updates; carrying on would
+                    // leave this client editing a stale doc. Drop the connection so
+                    // y-websocket reconnects and resyncs the full state.
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(n, link_id = paste.link_id, "ws client lagged; closing for resync");
+                        break;
+                    }
                     Err(_) => break,
                 }
             }
