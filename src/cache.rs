@@ -427,8 +427,12 @@ mod tests {
         let dir = scratch_dir();
         let cache = DiskCache::open_with(&dir, 100, 100).await.unwrap();
         let k = put(&cache, b"hello").await;
-        tokio::fs::write(dir.join("upload-leftover"), b"x").await.unwrap();
-        tokio::fs::write(dir.join("fill-leftover"), b"x").await.unwrap();
+        tokio::fs::write(dir.join("upload-leftover"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("fill-leftover"), b"x")
+            .await
+            .unwrap();
         drop(cache);
 
         let cache = DiskCache::open_with(&dir, 100, 100).await.unwrap();

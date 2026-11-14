@@ -677,9 +677,7 @@ async fn file_body(st: &AppState, key: &str, size: i64) -> Result<Body, Response
     }
     let object = match st.store.get(key).await {
         Ok(Some(b)) => b,
-        Ok(None) => {
-            return Err((StatusCode::NOT_FOUND, "file missing in storage").into_response())
-        }
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "file missing in storage").into_response()),
         Err(e) => {
             tracing::error!(key = %key, ?e, "R2 get failed");
             return Err((StatusCode::BAD_GATEWAY, "storage unavailable").into_response());
@@ -696,35 +694,32 @@ async fn file_body(st: &AppState, key: &str, size: i64) -> Result<Body, Response
     // Copy each chunk into the cache on its way out. The copy is kept once
     // every byte has passed (checked against the hash); if the client goes
     // away first, the stream is dropped and so is the partial copy.
-    let teed = futures::stream::unfold(
-        (stream, Some(fill)),
-        |(mut stream, mut fill)| async move {
-            match stream.next().await {
-                Some(Ok(chunk)) => {
-                    if let Some(f) = fill.as_mut() {
-                        if f.write(&chunk).await.is_err() {
-                            fill = None;
-                        }
+    let teed = futures::stream::unfold((stream, Some(fill)), |(mut stream, mut fill)| async move {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                if let Some(f) = fill.as_mut() {
+                    if f.write(&chunk).await.is_err() {
+                        fill = None;
                     }
-                    // Finish as soon as the last byte is in: with a known
-                    // Content-Length the server may stop polling right after it.
-                    if fill.as_ref().is_some_and(|f| f.complete()) {
-                        if let Some(f) = fill.take() {
-                            f.finish().await;
-                        }
-                    }
-                    Some((Ok::<_, std::io::Error>(chunk), (stream, fill)))
                 }
-                Some(Err(e)) => Some((Err(e), (stream, None))),
-                None => {
-                    if let Some(f) = fill {
+                // Finish as soon as the last byte is in: with a known
+                // Content-Length the server may stop polling right after it.
+                if fill.as_ref().is_some_and(|f| f.complete()) {
+                    if let Some(f) = fill.take() {
                         f.finish().await;
                     }
-                    None
                 }
+                Some((Ok::<_, std::io::Error>(chunk), (stream, fill)))
             }
-        },
-    );
+            Some(Err(e)) => Some((Err(e), (stream, None))),
+            None => {
+                if let Some(f) = fill {
+                    f.finish().await;
+                }
+                None
+            }
+        }
+    });
     Ok(Body::from_stream(teed))
 }
 
@@ -1257,7 +1252,10 @@ async fn note_upload(
                         },
                         Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "invalid password"),
                         Err(e) => {
-                            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}"))
+                            return json_err(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("auth: {e}"),
+                            )
                         }
                     }
                 } else if note.open_uploads {
