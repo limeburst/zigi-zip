@@ -15,7 +15,10 @@ table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
 th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); vertical-align: top; white-space: nowrap; }
 td.wrap { white-space: normal; word-break: break-all; }
 th { font-weight: 600; }
-td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25rem; }
+.scroll { overflow-x: auto; }
+.tag { font-size: 0.75rem; opacity: 0.7; border: 1px solid currentColor; padding: 0 0.3rem; white-space: nowrap; }
 {% endblock %}
 {% block body %}
 <h1>zigi.zip</h1>
@@ -63,53 +66,57 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 </form>
 
 {% if mine %}
-<h2>files ({{ mine.files | length }})</h2>
+{% macro at(t) %}<time datetime="{{ t.iso }}" title="{{ t.text }}">{{ t.text }}</time>{% endmacro %}
+<h2>files <span class="count">{{ mine.files | length }}{% if mine.files %} · {{ mine.files_total }}{% endif %}</span></h2>
 {% if mine.files %}
-<table>
-  <thead><tr><th>code</th><th>filename</th><th>size</th><th>uploaded</th></tr></thead>
+<div class="scroll"><table>
+  <thead><tr><th>filename</th><th>code</th><th class="num">size</th><th>uploaded</th><th>in note</th></tr></thead>
   <tbody>
   {% for f in mine.files %}
     <tr>
+      <td class="wrap"><a href="/{{ f.code }}">{{ f.name }}</a>{% if f.via_link %} <span class="tag" title="uploaded by someone with the note's link">via link</span>{% endif %}</td>
       <td><a href="/{{ f.code }}">{{ f.code }}</a></td>
-      <td class="wrap">{{ f.original_name }}</td>
-      <td class="num">{{ f.size_bytes }}</td>
-      <td>{{ f.uploaded_at }}</td>
+      <td class="num">{{ f.size }}</td>
+      <td>{{ at(f.at) }}</td>
+      <td>{% if f.note %}<a href="/{{ f.note }}">{{ f.note }}</a>{% endif %}</td>
     </tr>
   {% endfor %}
   </tbody>
-</table>
-{% else %}<p class="hint">none</p>{% endif %}
+</table></div>
+{% else %}<p class="hint">nothing uploaded yet</p>{% endif %}
 
-<h2>notes ({{ mine.pastes | length }})</h2>
-{% if mine.pastes %}
-<table>
-  <thead><tr><th>code</th><th>updated</th></tr></thead>
+<h2>notes <span class="count">{{ mine.notes | length }}</span></h2>
+{% if mine.notes %}
+<div class="scroll"><table>
+  <thead><tr><th>code</th><th class="num">files</th><th>last edited</th><th>created</th></tr></thead>
   <tbody>
-  {% for p in mine.pastes %}
+  {% for n in mine.notes %}
     <tr>
-      <td><a href="/{{ p.code }}">{{ p.code }}</a></td>
-      <td>{{ p.updated_at }}</td>
+      <td><a href="/{{ n.code }}">{{ n.code }}</a></td>
+      <td class="num">{{ n.files or "" }}</td>
+      <td>{{ at(n.updated) }}</td>
+      <td>{{ at(n.created) }}</td>
     </tr>
   {% endfor %}
   </tbody>
-</table>
-{% else %}<p class="hint">none</p>{% endif %}
+</table></div>
+{% else %}<p class="hint">no notes yet</p>{% endif %}
 
-<h2>short links ({{ mine.short_links | length }})</h2>
+<h2>short links <span class="count">{{ mine.short_links | length }}</span></h2>
 {% if mine.short_links %}
-<table>
-  <thead><tr><th>code</th><th>destination</th><th>created</th></tr></thead>
+<div class="scroll"><table>
+  <thead><tr><th>code</th><th>goes to</th><th>created</th></tr></thead>
   <tbody>
   {% for s in mine.short_links %}
     <tr>
       <td><a href="/{{ s.code }}">{{ s.code }}</a></td>
-      <td class="wrap">{{ s.destination_url }}</td>
-      <td>{{ s.created_at }}</td>
+      <td class="wrap"><a href="{{ s.destination }}" rel="noopener noreferrer">{{ s.destination }}</a></td>
+      <td>{{ at(s.at) }}</td>
     </tr>
   {% endfor %}
   </tbody>
-</table>
-{% else %}<p class="hint">none</p>{% endif %}
+</table></div>
+{% else %}<p class="hint">no short links yet</p>{% endif %}
 {% endif %}
 
 <script>
@@ -125,6 +132,14 @@ if (pw) pw.addEventListener('keydown', function (e) {
 });
 document.getElementById('file').addEventListener('change', function () {
   if (this.files.length) document.getElementById('upload-btn').click();
+});
+// Times arrive in UTC; show them in the viewer's own time zone.
+const pad = (n) => String(n).padStart(2, '0');
+document.querySelectorAll('time[datetime]').forEach(function (t) {
+  const d = new Date(t.getAttribute('datetime'));
+  if (isNaN(d)) return;
+  t.textContent = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
 });
 </script>
 {% endblock %}

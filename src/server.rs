@@ -80,7 +80,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         )
         .route("/signin", get(to_front).post(sign_in))
         .route("/signout", axum::routing::post(sign_out))
-        .route("/my", get(to_front).post(my_view))
+        .route("/my", get(my_view).post(my_post))
         .route("/url", get(to_front).post(shorten))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
@@ -872,98 +872,120 @@ struct MyForm {
     password: String,
 }
 
-async fn my_view(
+/// The front page's "my stuff" button: sign in if a password came with it,
+/// then go to /my, so the page can be refreshed and bookmarked.
+async fn my_post(
     State(st): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<MyForm>,
 ) -> Response {
-    let auth = match authenticate(&st, &headers, &form.password).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return front_unauthorized(!form.password.is_empty()),
+    match authenticate(&st, &headers, &form.password).await {
+        Ok(Some(a)) => session::with_cookie(Redirect::to("/my").into_response(), a.set_cookie),
+        Ok(None) => front_unauthorized(!form.password.is_empty()),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    }
+}
+
+/// Everything filed under the signed-in password.
+async fn my_view(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let me = match session::current(&st.pool, &headers).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "sign in to see your stuff"),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
-    let (pw_id, pw_label) = (auth.id, auth.label.clone());
+    match my_stuff(&st.pool, me.id).await {
+        Ok(mine) => front(
+            StatusCode::OK,
+            context! { signed_in => me.label, mine => mine },
+        ),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("my stuff: {e}")),
+    }
+}
 
-    let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
-        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at
-         FROM files f JOIN links l ON l.id = f.link_id
+type At = chrono::DateTime<chrono::Utc>;
+
+async fn my_stuff(pool: &PgPool, pw_id: i64) -> anyhow::Result<minijinja::Value> {
+    let files: Vec<(String, String, i64, At, Option<String>, bool)> = sqlx::query_as(
+        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at,
+                nl.short_code, f.via_link
+         FROM files f
+         JOIN links l ON l.id = f.link_id
+         LEFT JOIN links nl ON nl.id = f.note_link_id
          WHERE f.uploaded_by = $1
          ORDER BY f.uploaded_at DESC",
     )
     .bind(pw_id)
-    .fetch_all(&st.pool)
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("files: {e}")),
-    };
+    .fetch_all(pool)
+    .await?;
 
-    let pastes: Vec<(String, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
-        "SELECT l.short_code, p.updated_at
+    let notes: Vec<(String, At, At, i64)> = sqlx::query_as(
+        "SELECT l.short_code, l.created_at, p.updated_at,
+                (SELECT COUNT(*) FROM files f WHERE f.note_link_id = p.link_id)
          FROM pastes p JOIN links l ON l.id = p.link_id
          WHERE p.created_by = $1
          ORDER BY p.updated_at DESC",
     )
     .bind(pw_id)
-    .fetch_all(&st.pool)
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("pastes: {e}")),
-    };
+    .fetch_all(pool)
+    .await?;
 
-    let short_links: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
+    let short_links: Vec<(String, String, At)> = sqlx::query_as(
         "SELECT l.short_code, sl.destination_url, sl.created_at
          FROM short_links sl JOIN links l ON l.id = sl.link_id
          WHERE sl.created_by = $1
          ORDER BY sl.created_at DESC",
     )
     .bind(pw_id)
-    .fetch_all(&st.pool)
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("short_links: {e}"),
-            )
-        }
-    };
+    .fetch_all(pool)
+    .await?;
 
-    let files_ctx: Vec<_> = files
+    let total: i64 = files.iter().map(|f| f.2).sum();
+    let files: Vec<_> = files
         .into_iter()
-        .map(|(code, name, size, at)| {
+        .map(|(code, name, size, at, note, via_link)| {
             context! {
-                code => code, original_name => name, size_bytes => size,
-                uploaded_at => at.to_rfc3339(),
+                code => code, name => name, size => human_size(size), at => when(at),
+                note => note, via_link => via_link,
             }
         })
         .collect();
-    let pastes_ctx: Vec<_> = pastes
+    let notes: Vec<_> = notes
         .into_iter()
-        .map(|(code, at)| context! { code => code, updated_at => at.to_rfc3339() })
-        .collect();
-    let short_links_ctx: Vec<_> = short_links
-        .into_iter()
-        .map(|(code, dest, at)| {
-            context! { code => code, destination_url => dest, created_at => at.to_rfc3339() }
+        .map(|(code, created, updated, files)| {
+            context! { code => code, created => when(created), updated => when(updated), files => files }
         })
         .collect();
+    let short_links: Vec<_> = short_links
+        .into_iter()
+        .map(|(code, dest, at)| context! { code => code, destination => dest, at => when(at) })
+        .collect();
+    Ok(context! {
+        files => files,
+        files_total => human_size(total),
+        notes => notes,
+        short_links => short_links,
+    })
+}
 
-    let page = front(
-        StatusCode::OK,
-        context! {
-            signed_in => auth.label,
-            mine => context! {
-                label => pw_label,
-                files => files_ctx,
-                pastes => pastes_ctx,
-                short_links => short_links_ctx,
-            },
-        },
-    );
-    session::with_cookie(page, auth.set_cookie)
+/// A size for people: "512 B", "3 KB", "1.4 MB", "2.1 GB".
+fn human_size(bytes: i64) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= K * K * K {
+        format!("{:.1} GB", b / (K * K * K))
+    } else if b >= K * K {
+        format!("{:.1} MB", b / (K * K))
+    } else if b >= K {
+        format!("{} KB", (b / K).round())
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// A timestamp for the page: `iso` for the browser to show in local time,
+/// `text` (UTC) for when it doesn't.
+fn when(at: At) -> minijinja::Value {
+    context! { iso => at.to_rfc3339(), text => at.format("%Y-%m-%d %H:%M UTC").to_string() }
 }
 
 #[derive(Deserialize)]
