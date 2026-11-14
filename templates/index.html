@@ -16,6 +16,11 @@ th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid col
 td.wrap { white-space: normal; word-break: break-all; }
 th { font-weight: 600; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.tabs { display: flex; gap: 0.25rem; margin: 2rem 0 0.75rem; border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); flex-wrap: wrap; }
+.tabs a { padding: 0.5rem 0.75rem; text-decoration: none; color: inherit; opacity: 0.6; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tabs a[aria-current] { opacity: 1; font-weight: 600; border-bottom-color: currentColor; }
+.tabs .count { font-weight: 400; opacity: 0.7; font-size: 0.85rem; }
+.pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
 h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25rem; }
 .scroll { overflow-x: auto; }
 .tag { font-size: 0.75rem; opacity: 0.7; border: 1px solid currentColor; padding: 0 0.3rem; white-space: nowrap; }
@@ -67,12 +72,19 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 
 {% if mine %}
 {% macro at(t) %}<time datetime="{{ t.iso }}" title="{{ t.text }}">{{ t.text }}</time>{% endmacro %}
-<h2>files <span class="count">{{ mine.files | length }}{% if mine.files %} · {{ mine.files_total }}{% endif %}</span></h2>
-{% if mine.files %}
+<nav class="tabs" aria-label="my stuff">
+  <a href="/my?tab=files"{% if mine.tab == "files" %} aria-current="page"{% endif %}>files <span class="count">{{ mine.counts.files }}</span></a>
+  <a href="/my?tab=notes"{% if mine.tab == "notes" %} aria-current="page"{% endif %}>notes <span class="count">{{ mine.counts.notes }}</span></a>
+  <a href="/my?tab=links"{% if mine.tab == "links" %} aria-current="page"{% endif %}>short links <span class="count">{{ mine.counts.links }}</span></a>
+</nav>
+
+{% if mine.tab == "files" %}
+{% if mine.rows %}
+<p class="hint">{{ mine.counts.files }} files · {{ mine.files_total }} in all</p>
 <div class="scroll"><table>
   <thead><tr><th>filename</th><th>code</th><th class="num">size</th><th>uploaded</th><th>in note</th></tr></thead>
   <tbody>
-  {% for f in mine.files %}
+  {% for f in mine.rows %}
     <tr>
       <td class="wrap"><a href="/{{ f.code }}">{{ f.name }}</a>{% if f.via_link %} <span class="tag" title="uploaded by someone with the note's link">via link</span>{% endif %}</td>
       <td><a href="/{{ f.code }}">{{ f.code }}</a></td>
@@ -85,12 +97,12 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 </table></div>
 {% else %}<p class="hint">nothing uploaded yet</p>{% endif %}
 
-<h2>notes <span class="count">{{ mine.notes | length }}</span></h2>
-{% if mine.notes %}
+{% elif mine.tab == "notes" %}
+{% if mine.rows %}
 <div class="scroll"><table>
   <thead><tr><th>code</th><th class="num">files</th><th>last edited</th><th>created</th></tr></thead>
   <tbody>
-  {% for n in mine.notes %}
+  {% for n in mine.rows %}
     <tr>
       <td><a href="/{{ n.code }}">{{ n.code }}</a></td>
       <td class="num">{{ n.files or "" }}</td>
@@ -102,12 +114,12 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 </table></div>
 {% else %}<p class="hint">no notes yet</p>{% endif %}
 
-<h2>short links <span class="count">{{ mine.short_links | length }}</span></h2>
-{% if mine.short_links %}
+{% else %}
+{% if mine.rows %}
 <div class="scroll"><table>
   <thead><tr><th>code</th><th>goes to</th><th>created</th></tr></thead>
   <tbody>
-  {% for s in mine.short_links %}
+  {% for s in mine.rows %}
     <tr>
       <td><a href="/{{ s.code }}">{{ s.code }}</a></td>
       <td class="wrap"><a href="{{ s.destination }}" rel="noopener noreferrer">{{ s.destination }}</a></td>
@@ -117,6 +129,15 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
   </tbody>
 </table></div>
 {% else %}<p class="hint">no short links yet</p>{% endif %}
+{% endif %}
+
+{% if mine.pages > 1 %}
+<nav class="pager" aria-label="pages">
+  {% if mine.page > 1 %}<a href="/my?tab={{ mine.tab }}&amp;page={{ mine.page - 1 }}">← newer</a>{% else %}<span></span>{% endif %}
+  <span class="hint">{{ mine.first }}–{{ mine.last }} of {{ mine.total }}</span>
+  {% if mine.page < mine.pages %}<a href="/my?tab={{ mine.tab }}&amp;page={{ mine.page + 1 }}">older →</a>{% else %}<span></span>{% endif %}
+</nav>
+{% endif %}
 {% endif %}
 
 <script>

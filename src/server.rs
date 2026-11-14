@@ -1,7 +1,9 @@
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::{ws::WebSocketUpgrade, DefaultBodyLimit, Form, Multipart, Path as AxPath, State},
+    extract::{
+        ws::WebSocketUpgrade, DefaultBodyLimit, Form, Multipart, Path as AxPath, Query, State,
+    },
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
@@ -886,14 +888,39 @@ async fn my_post(
     }
 }
 
-/// Everything filed under the signed-in password.
-async fn my_view(State(st): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct MyQuery {
+    tab: Option<String>,
+    // Kept as text so a mangled page number falls back to page 1.
+    page: Option<String>,
+}
+
+/// Rows per page on /my.
+const MY_PAGE: i64 = 25;
+
+/// What's filed under the signed-in password: one section (tab) at a time,
+/// a page at a time, so the page stays short however much there is.
+async fn my_view(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MyQuery>,
+) -> Response {
     let me = match session::current(&st.pool, &headers).await {
         Ok(Some(m)) => m,
         Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "sign in to see your stuff"),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
-    match my_stuff(&st.pool, me.id).await {
+    let tab = match q.tab.as_deref() {
+        Some("notes") => "notes",
+        Some("links") => "links",
+        _ => "files",
+    };
+    let page = q
+        .page
+        .and_then(|p| p.parse::<i64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    match my_stuff(&st.pool, me.id, tab, page).await {
         Ok(mine) => front(
             StatusCode::OK,
             context! { signed_in => me.label, mine => mine },
@@ -904,66 +931,106 @@ async fn my_view(State(st): State<AppState>, headers: HeaderMap) -> Response {
 
 type At = chrono::DateTime<chrono::Utc>;
 
-async fn my_stuff(pool: &PgPool, pw_id: i64) -> anyhow::Result<minijinja::Value> {
-    let files: Vec<(String, String, i64, At, Option<String>, bool)> = sqlx::query_as(
-        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at,
-                nl.short_code, f.via_link
-         FROM files f
-         JOIN links l ON l.id = f.link_id
-         LEFT JOIN links nl ON nl.id = f.note_link_id
-         WHERE f.uploaded_by = $1
-         ORDER BY f.uploaded_at DESC",
+async fn my_stuff(
+    pool: &PgPool,
+    pw_id: i64,
+    tab: &str,
+    page: i64,
+) -> anyhow::Result<minijinja::Value> {
+    let (n_files, files_bytes, n_notes, n_links): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT COUNT(*) FROM files WHERE uploaded_by = $1),
+           (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM files WHERE uploaded_by = $1),
+           (SELECT COUNT(*) FROM pastes WHERE created_by = $1),
+           (SELECT COUNT(*) FROM short_links WHERE created_by = $1)",
     )
     .bind(pw_id)
-    .fetch_all(pool)
+    .fetch_one(pool)
     .await?;
+    let total = match tab {
+        "notes" => n_notes,
+        "links" => n_links,
+        _ => n_files,
+    };
+    let pages = ((total + MY_PAGE - 1) / MY_PAGE).max(1);
+    let page = page.min(pages);
+    let offset = (page - 1) * MY_PAGE;
 
-    let notes: Vec<(String, At, At, i64)> = sqlx::query_as(
-        "SELECT l.short_code, l.created_at, p.updated_at,
-                (SELECT COUNT(*) FROM files f WHERE f.note_link_id = p.link_id)
-         FROM pastes p JOIN links l ON l.id = p.link_id
-         WHERE p.created_by = $1
-         ORDER BY p.updated_at DESC",
-    )
-    .bind(pw_id)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<minijinja::Value> = match tab {
+        "notes" => {
+            let rows: Vec<(String, At, At, i64)> = sqlx::query_as(
+                "SELECT l.short_code, l.created_at, p.updated_at,
+                        (SELECT COUNT(*) FROM files f WHERE f.note_link_id = p.link_id)
+                 FROM pastes p JOIN links l ON l.id = p.link_id
+                 WHERE p.created_by = $1
+                 ORDER BY p.updated_at DESC
+                 LIMIT $2 OFFSET $3",
+            )
+            .bind(pw_id)
+            .bind(MY_PAGE)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter()
+                .map(|(code, created, updated, files)| {
+                    context! { code => code, created => when(created), updated => when(updated), files => files }
+                })
+                .collect()
+        }
+        "links" => {
+            let rows: Vec<(String, String, At)> = sqlx::query_as(
+                "SELECT l.short_code, sl.destination_url, sl.created_at
+                 FROM short_links sl JOIN links l ON l.id = sl.link_id
+                 WHERE sl.created_by = $1
+                 ORDER BY sl.created_at DESC
+                 LIMIT $2 OFFSET $3",
+            )
+            .bind(pw_id)
+            .bind(MY_PAGE)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter()
+                .map(|(code, dest, at)| context! { code => code, destination => dest, at => when(at) })
+                .collect()
+        }
+        _ => {
+            let rows: Vec<(String, String, i64, At, Option<String>, bool)> = sqlx::query_as(
+                "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at,
+                        nl.short_code, f.via_link
+                 FROM files f
+                 JOIN links l ON l.id = f.link_id
+                 LEFT JOIN links nl ON nl.id = f.note_link_id
+                 WHERE f.uploaded_by = $1
+                 ORDER BY f.uploaded_at DESC
+                 LIMIT $2 OFFSET $3",
+            )
+            .bind(pw_id)
+            .bind(MY_PAGE)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter()
+                .map(|(code, name, size, at, note, via_link)| {
+                    context! {
+                        code => code, name => name, size => human_size(size), at => when(at),
+                        note => note, via_link => via_link,
+                    }
+                })
+                .collect()
+        }
+    };
 
-    let short_links: Vec<(String, String, At)> = sqlx::query_as(
-        "SELECT l.short_code, sl.destination_url, sl.created_at
-         FROM short_links sl JOIN links l ON l.id = sl.link_id
-         WHERE sl.created_by = $1
-         ORDER BY sl.created_at DESC",
-    )
-    .bind(pw_id)
-    .fetch_all(pool)
-    .await?;
-
-    let total: i64 = files.iter().map(|f| f.2).sum();
-    let files: Vec<_> = files
-        .into_iter()
-        .map(|(code, name, size, at, note, via_link)| {
-            context! {
-                code => code, name => name, size => human_size(size), at => when(at),
-                note => note, via_link => via_link,
-            }
-        })
-        .collect();
-    let notes: Vec<_> = notes
-        .into_iter()
-        .map(|(code, created, updated, files)| {
-            context! { code => code, created => when(created), updated => when(updated), files => files }
-        })
-        .collect();
-    let short_links: Vec<_> = short_links
-        .into_iter()
-        .map(|(code, dest, at)| context! { code => code, destination => dest, at => when(at) })
-        .collect();
     Ok(context! {
-        files => files,
-        files_total => human_size(total),
-        notes => notes,
-        short_links => short_links,
+        tab => tab,
+        rows => rows,
+        counts => context! { files => n_files, notes => n_notes, links => n_links },
+        files_total => human_size(files_bytes),
+        page => page,
+        pages => pages,
+        first => if total == 0 { 0 } else { offset + 1 },
+        last => (offset + MY_PAGE).min(total),
+        total => total,
     })
 }
 
