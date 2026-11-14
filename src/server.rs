@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     body::Body,
     extract::{ws::WebSocketUpgrade, DefaultBodyLimit, Form, Multipart, Path as AxPath, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Json, Router,
@@ -21,8 +21,8 @@ use tokio_util::io::ReaderStream;
 use minijinja::context;
 
 use crate::{
-    cache::DiskCache, config::Config, links, passwd, paste, shortcode, storage::Storage, templates,
-    wordlist,
+    cache::DiskCache, config::Config, links, passwd, paste, session, shortcode, storage::Storage,
+    templates, wordlist,
 };
 
 #[derive(Clone)]
@@ -78,6 +78,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
             "/admin/passwd/rotate",
             axum::routing::post(admin_passwd_rotate),
         )
+        .route("/signout", axum::routing::post(sign_out))
         .route("/my", get(to_front).post(my_view))
         .route("/url", get(to_front).post(shorten))
         .route("/:code", get(dispatch_code))
@@ -98,8 +99,64 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-async fn root() -> Response {
-    front(StatusCode::OK, context! {})
+async fn root(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let signed_in = match session::current(&st.pool, &headers).await {
+        Ok(s) => s.map(|s| s.label),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    front(StatusCode::OK, context! { signed_in => signed_in })
+}
+
+async fn sign_out(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    match session::end(&st.pool, &headers, st.secure_cookies()).await {
+        Ok(c) => session::with_cookie(Redirect::to("/").into_response(), Some(c)),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("sign out: {e}")),
+    }
+}
+
+/// Whose request this is. A typed password wins, and signs the browser in
+/// (`set_cookie`) so it isn't needed again; with none, the session cookie
+/// decides.
+struct Auth {
+    id: i64,
+    label: String,
+    is_admin: bool,
+    set_cookie: Option<String>,
+}
+
+async fn authenticate(
+    st: &AppState,
+    headers: &HeaderMap,
+    password: &str,
+) -> anyhow::Result<Option<Auth>> {
+    if password.is_empty() {
+        return Ok(session::current(&st.pool, headers).await?.map(|s| Auth {
+            id: s.id,
+            label: s.label,
+            is_admin: s.is_admin,
+            set_cookie: None,
+        }));
+    }
+    let Some((id, label)) = passwd::verify_password(&st.pool, password).await? else {
+        return Ok(None);
+    };
+    let is_admin: bool = sqlx::query_scalar("SELECT is_admin FROM passwords WHERE id = $1")
+        .bind(id)
+        .fetch_one(&st.pool)
+        .await?;
+    let set_cookie = Some(session::create(&st.pool, id, st.secure_cookies()).await?);
+    Ok(Some(Auth {
+        id,
+        label,
+        is_admin,
+        set_cookie,
+    }))
+}
+
+impl AppState {
+    fn secure_cookies(&self) -> bool {
+        self.cfg.base_url.starts_with("https://")
+    }
 }
 
 /// The old per-action pages are all on the front page now.
@@ -107,8 +164,8 @@ async fn to_front() -> Redirect {
     Redirect::to("/")
 }
 
-/// Render the front page. `extra` may carry `error`, `password` (echoed back
-/// so the next action doesn't need it retyped), a `result_*` block, or `mine`.
+/// Render the front page. `extra` may carry `error`, `signed_in` (the label
+/// the browser is signed in as), a `result_*` block, or `mine`.
 fn front(status: StatusCode, extra: minijinja::Value) -> Response {
     (
         status,
@@ -120,8 +177,19 @@ fn front(status: StatusCode, extra: minijinja::Value) -> Response {
         .into_response()
 }
 
-fn front_error(status: StatusCode, msg: &str, password: &str) -> Response {
-    front(status, context! { error => msg, password => password })
+fn front_error(status: StatusCode, msg: &str) -> Response {
+    front(status, context! { error => msg })
+}
+
+/// The front page's answer to a password that didn't match, or a session
+/// that has ended.
+fn front_unauthorized(typed: bool) -> Response {
+    let msg = if typed {
+        "invalid password"
+    } else {
+        "enter your password"
+    };
+    front_error(StatusCode::UNAUTHORIZED, msg)
 }
 
 async fn admin_login() -> Html<String> {
@@ -563,15 +631,21 @@ async fn render_admin(
 
 #[derive(Deserialize)]
 struct PasteForm {
+    #[serde(default)]
     password: String,
 }
 
-async fn create_paste(State(st): State<AppState>, Form(form): Form<PasteForm>) -> Response {
-    let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
-        Ok(Some(v)) => v,
-        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "invalid password", ""),
+async fn create_paste(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PasteForm>,
+) -> Response {
+    let auth = match authenticate(&st, &headers, &form.password).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return front_unauthorized(!form.password.is_empty()),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")).into_response(),
     };
+    let (pw_id, pw_label) = (auth.id, auth.label);
 
     let (link_id, code) = match links::allocate(&st.pool, links::KIND_CODE).await {
         Ok(v) => v,
@@ -594,7 +668,10 @@ async fn create_paste(State(st): State<AppState>, Form(form): Form<PasteForm>) -
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("insert: {e}")).into_response();
     }
 
-    Redirect::to(&format!("/{}", code)).into_response()
+    session::with_cookie(
+        Redirect::to(&format!("/{}", code)).into_response(),
+        auth.set_cookie,
+    )
 }
 
 async fn dispatch_code(State(st): State<AppState>, AxPath(code): AxPath<String>) -> Response {
@@ -771,15 +848,21 @@ async fn serve_redirect(st: &AppState, link_id: i64) -> Response {
 
 #[derive(Deserialize)]
 struct MyForm {
+    #[serde(default)]
     password: String,
 }
 
-async fn my_view(State(st): State<AppState>, Form(form): Form<MyForm>) -> Response {
-    let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
-        Ok(Some(v)) => v,
-        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "invalid password", ""),
+async fn my_view(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<MyForm>,
+) -> Response {
+    let auth = match authenticate(&st, &headers, &form.password).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return front_unauthorized(!form.password.is_empty()),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
+    let (pw_id, pw_label) = (auth.id, auth.label.clone());
 
     let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
         "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at
@@ -848,10 +931,10 @@ async fn my_view(State(st): State<AppState>, Form(form): Form<MyForm>) -> Respon
         })
         .collect();
 
-    front(
+    let page = front(
         StatusCode::OK,
         context! {
-            password => form.password,
+            signed_in => auth.label,
             mine => context! {
                 label => pw_label,
                 files => files_ctx,
@@ -859,37 +942,44 @@ async fn my_view(State(st): State<AppState>, Form(form): Form<MyForm>) -> Respon
                 short_links => short_links_ctx,
             },
         },
-    )
+    );
+    session::with_cookie(page, auth.set_cookie)
 }
 
 #[derive(Deserialize)]
 struct ShortenForm {
+    #[serde(default)]
     password: String,
     url: String,
 }
 
-async fn shorten(State(st): State<AppState>, Form(form): Form<ShortenForm>) -> Response {
-    let url = form.url.trim().to_string();
-    if url.is_empty() {
-        return front_error(
-            StatusCode::BAD_REQUEST,
-            "enter a URL to shorten",
-            &form.password,
-        );
-    }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return front_error(
-            StatusCode::BAD_REQUEST,
-            "url must start with http:// or https://",
-            &form.password,
-        );
-    }
-
-    let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &form.password).await {
-        Ok(Some(v)) => v,
-        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "invalid password", ""),
+async fn shorten(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ShortenForm>,
+) -> Response {
+    // Sign in first, so a typo'd URL doesn't cost the password too.
+    let auth = match authenticate(&st, &headers, &form.password).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return front_unauthorized(!form.password.is_empty()),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
+    let url = form.url.trim().to_string();
+    let bad = if url.is_empty() {
+        Some("enter a URL to shorten")
+    } else if !url.starts_with("http://") && !url.starts_with("https://") {
+        Some("url must start with http:// or https://")
+    } else {
+        None
+    };
+    if let Some(msg) = bad {
+        let page = front(
+            StatusCode::BAD_REQUEST,
+            context! { error => msg, signed_in => auth.label },
+        );
+        return session::with_cookie(page, auth.set_cookie);
+    }
+    let (pw_id, pw_label) = (auth.id, auth.label.clone());
 
     let (link_id, code) = match links::allocate(&st.pool, links::KIND_URL).await {
         Ok(v) => v,
@@ -911,16 +1001,17 @@ async fn shorten(State(st): State<AppState>, Form(form): Form<ShortenForm>) -> R
 
     let short_url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), code);
     let qr_svg = qr_svg(&short_url).unwrap_or_default();
-    front(
+    let page = front(
         StatusCode::OK,
         context! {
-            password => form.password,
+            signed_in => auth.label,
             result_kind => "short link",
             result_url => short_url,
             result_destination => url,
             qr_svg => qr_svg,
         },
-    )
+    );
+    session::with_cookie(page, auth.set_cookie)
 }
 
 // ---------- file upload ----------
@@ -1073,13 +1164,13 @@ async fn store_spooled(
     Ok(code)
 }
 
-async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
-    let mut password: Option<String> = None;
+async fn upload(State(st): State<AppState>, headers: HeaderMap, mut mp: Multipart) -> Response {
+    let mut password = String::new();
     let mut spooled: Option<Spooled> = None;
 
     while let Ok(Some(mut field)) = mp.next_field().await {
         match field.name().unwrap_or("") {
-            "password" => password = Some(field.text().await.unwrap_or_default()),
+            "password" => password = field.text().await.unwrap_or_default(),
             "file" => match spool(&mut field, spool_path(&st), None).await {
                 Ok(s) => {
                     if let Some(old) = spooled.replace(s) {
@@ -1096,29 +1187,28 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
         }
     }
 
-    let Some(pw) = password else {
-        discard(&spooled).await;
-        return err(StatusCode::BAD_REQUEST, "missing password".into());
-    };
-    let Some(s) = spooled else {
-        return front_error(StatusCode::BAD_REQUEST, "choose a file to upload", &pw);
-    };
-
-    let (pw_id, pw_label) = match passwd::verify_password(&st.pool, &pw).await {
-        Ok(Some(v)) => v,
+    let auth = match authenticate(&st, &headers, &password).await {
+        Ok(Some(a)) => a,
         Ok(None) => {
-            let _ = tokio::fs::remove_file(&s.tmp).await;
-            return front_error(StatusCode::UNAUTHORIZED, "invalid password", "");
+            discard(&spooled).await;
+            return front_unauthorized(!password.is_empty());
         }
         Err(e) => {
-            let _ = tokio::fs::remove_file(&s.tmp).await;
+            discard(&spooled).await;
             return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}"));
         }
     };
+    let Some(s) = spooled else {
+        let page = front(
+            StatusCode::BAD_REQUEST,
+            context! { error => "choose a file to upload", signed_in => auth.label },
+        );
+        return session::with_cookie(page, auth.set_cookie);
+    };
 
     let who = Uploader {
-        by: Some(pw_id),
-        label: pw_label,
+        by: Some(auth.id),
+        label: auth.label.clone(),
         note_link_id: None,
         via_link: false,
     };
@@ -1129,10 +1219,11 @@ async fn upload(State(st): State<AppState>, mut mp: Multipart) -> Response {
 
     let url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), code);
     let qr_svg = qr_svg(&url).unwrap_or_default();
-    front(
+    let page = front(
         StatusCode::OK,
-        context! { password => pw, result_kind => "uploaded", result_url => url, qr_svg => qr_svg },
-    )
+        context! { signed_in => auth.label, result_kind => "uploaded", result_url => url, qr_svg => qr_svg },
+    );
+    session::with_cookie(page, auth.set_cookie)
 }
 
 async fn discard(s: &Option<Spooled>) {
@@ -1183,7 +1274,11 @@ async fn notify_files_changed(st: &AppState, note_link_id: i64) {
     }
 }
 
-async fn note_files(State(st): State<AppState>, AxPath(code): AxPath<String>) -> Response {
+async fn note_files(
+    State(st): State<AppState>,
+    AxPath(code): AxPath<String>,
+    headers: HeaderMap,
+) -> Response {
     let note = match note_by_code(&st.pool, &code).await {
         Ok(Some(n)) => n,
         // Not a note: this is a file link with a name after it, as before.
@@ -1209,9 +1304,20 @@ async fn note_files(State(st): State<AppState>, AxPath(code): AxPath<String>) ->
             json!({ "code": code, "name": name, "size": size, "uploaded_at": at.to_rfc3339() })
         })
         .collect();
+    // Lets the page skip the password box for a signed-in browser, and show
+    // owner settings as usable for its owner (or an admin).
+    let me = match session::current(&st.pool, &headers).await {
+        Ok(m) => m,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let can_manage = me
+        .as_ref()
+        .is_some_and(|m| note.owner == Some(m.id) || m.is_admin);
     (
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
+            "signed_in": me.map(|m| m.label),
+            "can_manage": can_manage,
             "open_uploads": note.open_uploads,
             "max_file": LINK_UPLOAD_MAX_FILE,
             "files": files,
@@ -1220,14 +1326,28 @@ async fn note_files(State(st): State<AppState>, AxPath(code): AxPath<String>) ->
         .into_response()
 }
 
-/// Upload one file into a note. With a valid password the file is filed
-/// under that password, as on the front page. Without one, the note's owner
-/// must have opened uploads to link holders; the file is then filed under the
-/// owner, capped in size, and only ever served as a download.
+/// Upload one file into a note. With a valid password, or signed in, the file
+/// is filed under that password, as on the front page. Otherwise the note's
+/// owner must have opened uploads to link holders; the file is then filed
+/// under the owner, capped in size, and only ever served as a download.
 async fn note_upload(
     State(st): State<AppState>,
     AxPath(code): AxPath<String>,
+    headers: HeaderMap,
+    mp: Multipart,
+) -> Response {
+    let mut set_cookie = None;
+    let res = note_upload_inner(&st, &code, &headers, mp, &mut set_cookie).await;
+    // A typed password signs the browser in, even if the upload then fails.
+    session::with_cookie(res, set_cookie)
+}
+
+async fn note_upload_inner(
+    st: &AppState,
+    code: &str,
+    headers: &HeaderMap,
     mut mp: Multipart,
+    set_cookie: &mut Option<String>,
 ) -> Response {
     let note = match note_by_code(&st.pool, &code).await {
         Ok(Some(n)) => n,
@@ -1242,22 +1362,22 @@ async fn note_upload(
             // upload this is (and its cap) before taking any bytes.
             "password" => password = field.text().await.unwrap_or_default(),
             "file" => {
-                let who = if !password.is_empty() {
-                    match passwd::verify_password(&st.pool, &password).await {
-                        Ok(Some((id, label))) => Uploader {
-                            by: Some(id),
-                            label,
-                            note_link_id: Some(note.link_id),
-                            via_link: false,
-                        },
-                        Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "invalid password"),
-                        Err(e) => {
-                            return json_err(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("auth: {e}"),
-                            )
-                        }
+                let auth = match authenticate(&st, headers, &password).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}"))
                     }
+                };
+                let who = if let Some(a) = auth {
+                    *set_cookie = a.set_cookie;
+                    Uploader {
+                        by: Some(a.id),
+                        label: a.label,
+                        note_link_id: Some(note.link_id),
+                        via_link: false,
+                    }
+                } else if !password.is_empty() {
+                    return json_err(StatusCode::UNAUTHORIZED, "invalid password");
                 } else if note.open_uploads {
                     Uploader {
                         by: note.owner,
@@ -1328,15 +1448,16 @@ async fn note_upload(
 
 #[derive(Deserialize)]
 struct NoteSettingsForm {
+    #[serde(default)]
     password: String,
     open_uploads: String,
 }
 
-/// Owner-only: open or close uploads without a password. An admin password
-/// works too.
+/// Owner-only: open or close uploads without a password. An admin works too.
 async fn note_settings(
     State(st): State<AppState>,
     AxPath(code): AxPath<String>,
+    headers: HeaderMap,
     Form(form): Form<NoteSettingsForm>,
 ) -> Response {
     let note = match note_by_code(&st.pool, &code).await {
@@ -1344,22 +1465,24 @@ async fn note_settings(
         Ok(None) => return json_err(StatusCode::NOT_FOUND, "not found"),
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
     };
-    let is_owner = match passwd::verify_password(&st.pool, &form.password).await {
-        Ok(Some((id, _))) => note.owner == Some(id),
+    let auth = match authenticate(&st, &headers, &form.password).await {
+        Ok(Some(a)) => a,
+        Ok(None) if form.password.is_empty() => {
+            return json_err(StatusCode::UNAUTHORIZED, "enter the owner's password")
+        }
         Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "invalid password"),
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
-    let allowed = is_owner
-        || matches!(
-            passwd::verify_admin(&st.pool, &form.password).await,
-            Ok(Some(_))
-        );
-    if !allowed {
-        return json_err(
-            StatusCode::FORBIDDEN,
-            "only the note's owner can change this",
+    if note.owner != Some(auth.id) && !auth.is_admin {
+        return session::with_cookie(
+            json_err(
+                StatusCode::FORBIDDEN,
+                "only the note's owner can change this",
+            ),
+            auth.set_cookie,
         );
     }
+    let set_cookie = auth.set_cookie;
     let open = form.open_uploads == "true";
     if let Err(e) = sqlx::query("UPDATE pastes SET open_uploads = $1 WHERE link_id = $2")
         .bind(open)
@@ -1370,7 +1493,10 @@ async fn note_settings(
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("update: {e}"));
     }
     notify_files_changed(&st, note.link_id).await;
-    Json(json!({ "open_uploads": open })).into_response()
+    session::with_cookie(
+        Json(json!({ "open_uploads": open })).into_response(),
+        set_cookie,
+    )
 }
 
 fn qr_svg(url: &str) -> Option<String> {

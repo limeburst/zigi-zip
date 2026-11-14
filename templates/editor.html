@@ -79,7 +79,7 @@ a.code { text-decoration: none; font-weight: 600; }
     <p id="pw-hint" class="hint"></p>
     <p id="files-msg" role="status"></p>
     <div class="owner">
-      <div class="hint">owner settings (needs the owner's password above)</div>
+      <div class="hint" id="owner-hint">owner settings (needs the owner's password above)</div>
       <label><input type="checkbox" id="open-uploads"> let anyone with this link upload</label>
       <p id="open-hint" class="hint"></p>
     </div>
@@ -100,6 +100,9 @@ a.code { text-decoration: none; font-weight: 600; }
   const openBox = $('open-uploads');
   let openUploads = false;
   let maxFile = 25 * 1024 * 1024;
+  // Set once the server says this browser is signed in: no password needed.
+  let signedIn = null;
+  let canManage = false;
 
   function fmtSize(b) {
     if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
@@ -109,7 +112,13 @@ a.code { text-decoration: none; font-weight: 600; }
 
   function showOpen() {
     openBox.checked = openUploads;
-    $('pw-hint').textContent = openUploads
+    pw.hidden = !!signedIn;
+    $('owner-hint').textContent = signedIn
+      ? (canManage ? 'owner settings' : 'owner settings (only the note\'s owner can change these)')
+      : 'owner settings (needs the owner\'s password above)';
+    $('pw-hint').textContent = signedIn
+      ? 'signed in as ' + signedIn + ': uploads are filed under you.'
+      : openUploads
       ? 'no password needed here: uploads are filed under the owner. leave it blank, or enter yours to file them under you.'
       : 'your zigi.zip password is needed to upload here.';
     $('open-hint').textContent = openUploads
@@ -124,6 +133,8 @@ a.code { text-decoration: none; font-weight: 600; }
       if (!r.ok) return;
       const data = await r.json();
       openUploads = !!data.open_uploads;
+      signedIn = data.signed_in || null;
+      canManage = !!data.can_manage;
       if (data.max_file) maxFile = data.max_file;
       tbody.replaceChildren(...data.files.map((f) => {
         const tr = document.createElement('tr');
@@ -154,7 +165,7 @@ a.code { text-decoration: none; font-weight: 600; }
       msg.textContent = 'uploading ' + f.name + '…';
       const fd = new FormData();
       // Password first: the server decides whose upload it is before the bytes.
-      if (pw.value) fd.append('password', pw.value);
+      if (pw.value && !signedIn) fd.append('password', pw.value);
       fd.append('file', f, f.name);
       let res, data;
       try {
@@ -201,11 +212,12 @@ a.code { text-decoration: none; font-weight: 600; }
   openBox.addEventListener('change', async () => {
     const want = openBox.checked;
     openBox.checked = openUploads;
-    if (!pw.value) { msg.textContent = 'enter the owner\'s password above first'; pw.focus(); return; }
-    const body = new URLSearchParams({ password: pw.value, open_uploads: want ? 'true' : 'false' });
+    if (!signedIn && !pw.value) { msg.textContent = 'enter the owner\'s password above first'; pw.focus(); return; }
+    const body = new URLSearchParams({ open_uploads: want ? 'true' : 'false' });
+    if (pw.value && !signedIn) body.set('password', pw.value);
     // One change at a time, so replies can't land out of order.
     openBox.disabled = true;
-    msg.textContent = 'checking password…';
+    msg.textContent = signedIn ? 'saving…' : 'checking password…';
     try {
       const r = await fetch('/' + code + '/settings', { method: 'POST', body });
       const data = await r.json().catch(() => ({}));
@@ -213,6 +225,7 @@ a.code { text-decoration: none; font-weight: 600; }
       openUploads = !!data.open_uploads;
       msg.textContent = openUploads ? 'uploads without a password: on' : 'uploads without a password: off';
       showOpen();
+      refresh(); // a typed password has signed this browser in
     } catch (e) {
       msg.textContent = 'could not change the setting';
     } finally {

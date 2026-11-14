@@ -9,6 +9,7 @@ mod links;
 mod passwd;
 mod paste;
 mod server;
+mod session;
 mod shortcode;
 mod storage;
 mod templates;

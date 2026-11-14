@@ -30,8 +30,15 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 </div>
 {% endif %}
 
+{% if signed_in %}
+<form method="post" action="/signout" id="signout"></form>
+<p class="hint">signed in as <strong>{{ signed_in }}</strong> · <button type="submit" form="signout">sign out</button></p>
+{% endif %}
+
 <form method="post" action="/file" enctype="multipart/form-data">
-  <input type="password" name="password" placeholder="password" required autocomplete="current-password" value="{{ password }}">
+  {% if not signed_in %}
+  <input type="password" name="password" placeholder="password" required autocomplete="current-password">
+  {% endif %}
 
   <div class="row-label">upload a file, get a short link</div>
   <fieldset>
@@ -53,8 +60,6 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 </form>
 
 {% if mine %}
-<p class="hint">signed in as <strong>{{ mine.label }}</strong></p>
-
 <h2>files ({{ mine.files | length }})</h2>
 {% if mine.files %}
 <table>

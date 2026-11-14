@@ -67,6 +67,8 @@ pub async fn rotate(pool: &PgPool, label: &str, password: &str) -> Result<()> {
     if res.rows_affected() == 0 {
         anyhow::bail!("no active password with label '{}'", label);
     }
+    // Browsers signed in with the old password have to sign in again.
+    crate::session::end_all_for(pool, label).await?;
     Ok(())
 }
 
