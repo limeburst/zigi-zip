@@ -692,6 +692,10 @@ async fn render_admin(
 struct PasteForm {
     #[serde(default)]
     password: String,
+    /// When the note (and the files put in it) stop working: never, 1h, 1d,
+    /// 7d or 30d.
+    #[serde(default)]
+    note_expires: String,
 }
 
 async fn create_paste(
@@ -705,8 +709,19 @@ async fn create_paste(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")).into_response(),
     };
     let (pw_id, pw_label) = (auth.id, auth.label);
+    let expires_at = match expiry_choice(&form.note_expires) {
+        Ok(at) => at,
+        Err(m) => {
+            let page = front(
+                StatusCode::BAD_REQUEST,
+                context! { error => m, signed_in => pw_label },
+            );
+            return session::with_cookie(page, auth.set_cookie);
+        }
+    };
 
-    let (link_id, code) = match links::allocate(&st.pool, links::KIND_CODE).await {
+    let (link_id, code) = match links::allocate_until(&st.pool, links::KIND_CODE, expires_at).await
+    {
         Ok(v) => v,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")).into_response()
@@ -1052,14 +1067,18 @@ async fn my_delete(
 #[derive(Deserialize)]
 struct MyExpireForm {
     code: String,
+    /// The /my tab to go back to: files or notes.
+    #[serde(default)]
+    tab: String,
     /// 1h, 1d, 7d, 30d (as the API's `expires`), or never.
     expires: String,
     #[serde(default)]
     page: String,
 }
 
-/// Change when one of the signed-in user's files stops working, then go
-/// back to the same page of /my.
+/// Change when one of the signed-in user's files or notes stops working,
+/// then go back to the same page of /my. A note's files go with it; a file
+/// in a note can't be set apart from it.
 async fn my_expire(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1074,9 +1093,14 @@ async fn my_expire(
         Ok(at) => at,
         Err(m) => return front_error(StatusCode::BAD_REQUEST, &m),
     };
-    let link_id: Option<i64> = match sqlx::query_scalar(
-        "SELECT l.id FROM links l JOIN files f ON f.link_id = l.id
-         WHERE l.short_code = $1 AND f.uploaded_by = $2
+    // Its link, whether it is a note, and for a file, the note it is in.
+    let found: Option<(i64, bool, Option<String>)> = match sqlx::query_as(
+        "SELECT l.id, p.link_id IS NOT NULL, nl.short_code
+         FROM links l
+         LEFT JOIN files f ON f.link_id = l.id
+         LEFT JOIN pastes p ON p.link_id = l.id
+         LEFT JOIN links nl ON nl.id = f.note_link_id
+         WHERE l.short_code = $1 AND (f.uploaded_by = $2 OR p.created_by = $2)
            AND (l.expires_at IS NULL OR l.expires_at > now())",
     )
     .bind(&form.code)
@@ -1087,16 +1111,30 @@ async fn my_expire(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
     };
-    let Some(link_id) = link_id else {
-        return front_error(StatusCode::NOT_FOUND, "no file of yours with that code");
+    let set = match found {
+        None => return front_error(StatusCode::NOT_FOUND, "nothing of yours with that code"),
+        Some((_, false, Some(note))) => {
+            let msg = format!(
+                "{} expires with its note, {note}: change it there",
+                form.code
+            );
+            return front_error(StatusCode::CONFLICT, &msg);
+        }
+        Some((link_id, true, _)) => links::set_note_expiry(&st.pool, link_id, expires_at).await,
+        Some((link_id, false, None)) => links::set_expiry(&st.pool, link_id, expires_at).await,
     };
-    if let Err(e) = links::set_expiry(&st.pool, link_id, expires_at).await {
+    if let Err(e) = set {
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("expiry: {e}"));
     }
+    let tab = if form.tab == "notes" {
+        "notes"
+    } else {
+        "files"
+    };
     let page = form.page.parse::<i64>().unwrap_or(1).max(1);
     let code =
         percent_encoding::utf8_percent_encode(&form.code, percent_encoding::NON_ALPHANUMERIC);
-    Redirect::to(&format!("/my?tab=files&page={page}&expiry={code}")).into_response()
+    Redirect::to(&format!("/my?tab={tab}&page={page}&expiry={code}")).into_response()
 }
 
 type At = chrono::DateTime<chrono::Utc>;
@@ -1113,7 +1151,8 @@ async fn my_stuff(
              WHERE f.uploaded_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())),
            (SELECT COALESCE(SUM(f.size_bytes), 0)::BIGINT FROM files f JOIN links l ON l.id = f.link_id
              WHERE f.uploaded_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())),
-           (SELECT COUNT(*) FROM pastes WHERE created_by = $1),
+           (SELECT COUNT(*) FROM pastes p JOIN links l ON l.id = p.link_id
+             WHERE p.created_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())),
            (SELECT COUNT(*) FROM short_links WHERE created_by = $1)",
     )
     .bind(pw_id)
@@ -1130,11 +1169,12 @@ async fn my_stuff(
 
     let rows: Vec<minijinja::Value> = match tab {
         "notes" => {
-            let rows: Vec<(String, At, At, i64)> = sqlx::query_as(
+            let rows: Vec<(String, At, At, i64, Option<At>)> = sqlx::query_as(
                 "SELECT l.short_code, l.created_at, p.updated_at,
-                        (SELECT COUNT(*) FROM files f WHERE f.note_link_id = p.link_id)
+                        (SELECT COUNT(*) FROM files f WHERE f.note_link_id = p.link_id),
+                        l.expires_at
                  FROM pastes p JOIN links l ON l.id = p.link_id
-                 WHERE p.created_by = $1
+                 WHERE p.created_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())
                  ORDER BY p.updated_at DESC
                  LIMIT $2 OFFSET $3",
             )
@@ -1144,8 +1184,11 @@ async fn my_stuff(
             .fetch_all(pool)
             .await?;
             rows.into_iter()
-                .map(|(code, created, updated, files)| {
-                    context! { code => code, created => when(created), updated => when(updated), files => files }
+                .map(|(code, created, updated, files, expires)| {
+                    context! {
+                        code => code, created => when(created), updated => when(updated),
+                        files => files, expires => expires.map(when),
+                    }
                 })
                 .collect()
         }
@@ -1571,23 +1614,31 @@ struct Note {
     owner: Option<i64>,
     owner_label: String,
     open_uploads: bool,
+    /// When it stops working, and the files in it with it.
+    expires_at: Option<At>,
 }
 
+/// The note with this code, unless it is past its expiry.
 async fn note_by_code(pool: &PgPool, code: &str) -> anyhow::Result<Option<Note>> {
-    let row: Option<(i64, Option<i64>, String, bool)> = sqlx::query_as(
-        "SELECT p.link_id, p.created_by, p.created_by_label, p.open_uploads
+    type Row = (i64, Option<i64>, String, bool, Option<At>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT p.link_id, p.created_by, p.created_by_label, p.open_uploads, l.expires_at
          FROM pastes p JOIN links l ON l.id = p.link_id
-         WHERE l.short_code = $1 AND l.kind = 'code'",
+         WHERE l.short_code = $1 AND l.kind = 'code'
+           AND (l.expires_at IS NULL OR l.expires_at > now())",
     )
     .bind(code)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(link_id, owner, owner_label, open_uploads)| Note {
-        link_id,
-        owner,
-        owner_label,
-        open_uploads,
-    }))
+    Ok(row.map(
+        |(link_id, owner, owner_label, open_uploads, expires_at)| Note {
+            link_id,
+            owner,
+            owner_label,
+            open_uploads,
+            expires_at,
+        },
+    ))
 }
 
 fn json_err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -1616,7 +1667,7 @@ async fn note_files(
     let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
         "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at
          FROM files f JOIN links l ON l.id = f.link_id
-         WHERE f.note_link_id = $1
+         WHERE f.note_link_id = $1 AND (l.expires_at IS NULL OR l.expires_at > now())
          ORDER BY f.uploaded_at",
     )
     .bind(note.link_id)
@@ -1647,6 +1698,7 @@ async fn note_files(
             "signed_in": me.map(|m| m.label),
             "can_manage": can_manage,
             "open_uploads": note.open_uploads,
+            "expires_at": note.expires_at.map(|t| t.to_rfc3339()),
             "max_file": LINK_UPLOAD_MAX_FILE,
             "files": files,
         })),
@@ -1703,7 +1755,7 @@ async fn note_upload_inner(
                         label: a.label,
                         note_link_id: Some(note.link_id),
                         via_link: false,
-                        expires_at: None,
+                        expires_at: note.expires_at,
                     }
                 } else if !password.is_empty() {
                     return json_err(StatusCode::UNAUTHORIZED, "invalid password");
@@ -1713,7 +1765,7 @@ async fn note_upload_inner(
                         label: format!("{} (via {})", note.owner_label, code),
                         note_link_id: Some(note.link_id),
                         via_link: true,
-                        expires_at: None,
+                        expires_at: note.expires_at,
                     }
                 } else {
                     return json_err(
@@ -1780,10 +1832,17 @@ async fn note_upload_inner(
 struct NoteSettingsForm {
     #[serde(default)]
     password: String,
-    open_uploads: String,
+    /// "true" or "false"; left out, unchanged.
+    #[serde(default)]
+    open_uploads: Option<String>,
+    /// When the note and its files stop working (never, 1h, 1d, 7d, 30d);
+    /// left out, unchanged.
+    #[serde(default)]
+    expires: Option<String>,
 }
 
-/// Owner-only: open or close uploads without a password. An admin works too.
+/// Owner-only: open or close uploads without a password, and change when the
+/// note and its files expire. An admin works too.
 async fn note_settings(
     State(st): State<AppState>,
     AxPath(code): AxPath<String>,
@@ -1813,18 +1872,37 @@ async fn note_settings(
         );
     }
     let set_cookie = auth.set_cookie;
-    let open = form.open_uploads == "true";
-    if let Err(e) = sqlx::query("UPDATE pastes SET open_uploads = $1 WHERE link_id = $2")
-        .bind(open)
-        .bind(note.link_id)
-        .execute(&st.pool)
-        .await
-    {
-        return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("update: {e}"));
+    let mut open = note.open_uploads;
+    if let Some(v) = &form.open_uploads {
+        open = v == "true";
+        if let Err(e) = sqlx::query("UPDATE pastes SET open_uploads = $1 WHERE link_id = $2")
+            .bind(open)
+            .bind(note.link_id)
+            .execute(&st.pool)
+            .await
+        {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("update: {e}"));
+        }
+    }
+    let mut expires_at = note.expires_at;
+    if let Some(v) = &form.expires {
+        expires_at = match expiry_choice(v) {
+            Ok(at) => at,
+            Err(m) => {
+                return session::with_cookie(json_err(StatusCode::BAD_REQUEST, m), set_cookie)
+            }
+        };
+        if let Err(e) = links::set_note_expiry(&st.pool, note.link_id, expires_at).await {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("expiry: {e}"));
+        }
     }
     notify_files_changed(&st, note.link_id).await;
     session::with_cookie(
-        Json(json!({ "open_uploads": open })).into_response(),
+        Json(json!({
+            "open_uploads": open,
+            "expires_at": expires_at.map(|t| t.to_rfc3339()),
+        }))
+        .into_response(),
         set_cookie,
     )
 }

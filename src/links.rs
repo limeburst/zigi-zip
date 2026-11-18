@@ -71,6 +71,24 @@ pub async fn set_expiry(
     Ok(())
 }
 
+/// Set when a note stops working, and the files in it with it: they expire
+/// together.
+pub async fn set_note_expiry(
+    pool: &PgPool,
+    note_link_id: i64,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE links SET expires_at = $2
+         WHERE id = $1 OR id IN (SELECT link_id FROM files WHERE note_link_id = $1)",
+    )
+    .bind(note_link_id)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// (link_id, kind) for a short code, if any, and not past its expiry.
 pub async fn lookup(pool: &PgPool, code: &str) -> Result<Option<(i64, String)>> {
     let row: Option<(i64, String)> = sqlx::query_as(

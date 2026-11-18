@@ -24,7 +24,7 @@ form.inline { display: inline; margin: 0; padding: 0; border: 0; }
 form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
 td.act { text-align: right; }
 form.expire { white-space: nowrap; }
-fieldset select { font: inherit; padding: 0.5rem; border-radius: 0; border: 1px solid color-mix(in srgb, currentColor 40%, transparent); background: transparent; color: inherit; }
+fieldset select, .actions select { font: inherit; padding: 0.5rem; border-radius: 0; border: 1px solid color-mix(in srgb, currentColor 40%, transparent); background: transparent; color: inherit; }
 form.expire select { font: inherit; font-size: 0.8rem; padding: 0.1rem; margin: 0 0.25rem 0 0.5rem; border-radius: 0; }
 .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
 h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25rem; }
@@ -80,6 +80,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 
   <div class="row-label">more</div>
   <div class="actions">
+    <select name="note_expires" aria-label="note expires" title="when the note, and the files put in it, stop working">{{ expiry_options("never") }}</select>
     <button type="submit" formaction="/code" formenctype="application/x-www-form-urlencoded">new collaborative note</button>
     <button type="submit" formaction="/my" formenctype="application/x-www-form-urlencoded">my stuff</button>
   </div>
@@ -107,9 +108,9 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
       <td><a href="/{{ f.code }}">{{ f.code }}</a></td>
       <td class="num">{{ f.size }}</td>
       <td>{{ at(f.at) }}</td>
-      <td><form class="inline expire" method="post" action="/my/expire">{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %}
-        <input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="page" value="{{ mine.page }}">
-        <select name="expires" aria-label="when {{ f.code }} expires">{{ expiry_options() }}</select><button type="submit">set</button></form></td>
+      <td>{% if f.note %}{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %} <span class="hint" title="files in a note expire with it">with {{ f.note }}</span>{% else %}<form class="inline expire" method="post" action="/my/expire">{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %}
+        <input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="files"><input type="hidden" name="page" value="{{ mine.page }}">
+        <select name="expires" aria-label="when {{ f.code }} expires">{{ expiry_options() }}</select><button type="submit">set</button></form>{% endif %}</td>
       <td>{% if f.note %}<a href="/{{ f.note }}">{{ f.note }}</a>{% endif %}</td>
       <td class="act"><a href="/{{ f.code }}?download" download>download</a> <form class="inline" method="post" action="/my/delete" data-confirm="delete {{ f.name }} ({{ f.code }})? its link stops working. this can't be undone."><input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>
@@ -121,7 +122,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 {% elif mine.tab == "notes" %}
 {% if mine.rows %}
 <div class="scroll"><table>
-  <thead><tr><th>code</th><th class="num">files</th><th>last edited</th><th>created</th><th></th></tr></thead>
+  <thead><tr><th>code</th><th class="num">files</th><th>last edited</th><th>created</th><th>expires, with its files</th><th></th></tr></thead>
   <tbody>
   {% for n in mine.rows %}
     <tr>
@@ -129,6 +130,9 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
       <td class="num">{{ n.files or "" }}</td>
       <td>{{ at(n.updated) }}</td>
       <td>{{ at(n.created) }}</td>
+      <td><form class="inline expire" method="post" action="/my/expire">{% if n.expires %}{{ at(n.expires) }}{% else %}never{% endif %}
+        <input type="hidden" name="code" value="{{ n.code }}"><input type="hidden" name="tab" value="notes"><input type="hidden" name="page" value="{{ mine.page }}">
+        <select name="expires" aria-label="when note {{ n.code }} and its files expire">{{ expiry_options() }}</select><button type="submit">set</button></form></td>
       <td class="act"><form class="inline" method="post" action="/my/delete" data-confirm="delete note {{ n.code }} and its text? files in it are kept. this can't be undone."><input type="hidden" name="code" value="{{ n.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>
   {% endfor %}
