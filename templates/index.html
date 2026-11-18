@@ -65,9 +65,9 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
   </fieldset>
   {% endif %}
 
-  <div class="row-label">uploads and new notes</div>
+  <div class="row-label">uploads, short links and new notes</div>
   <fieldset>
-    <select name="expires" id="expires" aria-label="uploads and new notes expire" title="when an upload's link, or a new note and the files put in it, stop working">{{ expiry_options("never") }}</select>
+    <select name="expires" id="expires" aria-label="uploads, short links and new notes expire" title="when an upload's link, a short link, or a new note and the files put in it, stop working">{{ expiry_options("never") }}</select>
   </fieldset>
 
   <div class="row-label">upload a file, get a short link</div>
@@ -146,13 +146,16 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 {% else %}
 {% if mine.rows %}
 <div class="scroll"><table>
-  <thead><tr><th>code</th><th>goes to</th><th>created</th><th></th></tr></thead>
+  <thead><tr><th>code</th><th>goes to</th><th>created</th><th>expires</th><th></th></tr></thead>
   <tbody>
   {% for s in mine.rows %}
     <tr>
       <td><a href="/{{ s.code }}">{{ s.code }}</a></td>
       <td class="wrap"><a href="{{ s.destination }}" rel="noopener noreferrer">{{ s.destination }}</a></td>
       <td>{{ at(s.at) }}</td>
+      <td><form class="inline expire" method="post" action="/my/expire">{% if s.expires %}{{ at(s.expires) }}{% else %}never{% endif %}
+        <input type="hidden" name="code" value="{{ s.code }}"><input type="hidden" name="page" value="{{ mine.page }}">
+        <select name="expires" aria-label="when {{ s.code }} expires">{{ expiry_options() }}</select><button type="submit">set</button></form></td>
       <td class="act"><form class="inline" method="post" action="/my/delete" data-confirm="delete short link {{ s.code }}? it stops redirecting. this can't be undone."><input type="hidden" name="code" value="{{ s.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>
   {% endfor %}

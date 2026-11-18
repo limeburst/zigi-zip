@@ -15,12 +15,8 @@ const RESERVED: &[&str] = &[
 
 /// Allocate a new link row with a unique short code. Starts at 3 chars and grows
 /// the code length after a few consecutive collisions, so URLs stay as short as
-/// possible early and lengthen naturally as the namespace fills.
-pub async fn allocate(pool: &PgPool, kind: &str) -> Result<(i64, String)> {
-    allocate_until(pool, kind, None).await
-}
-
-/// `allocate`, for a link that stops working at `expires_at` (or never).
+/// possible early and lengthen naturally as the namespace fills. The link
+/// stops working at `expires_at`, or never.
 pub async fn allocate_until(
     pool: &PgPool,
     kind: &str,

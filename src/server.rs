@@ -1067,16 +1067,13 @@ async fn my_delete(
 #[derive(Deserialize)]
 struct MyExpireForm {
     code: String,
-    /// The /my tab to go back to: files or notes.
-    #[serde(default)]
-    tab: String,
     /// 1h, 1d, 7d, 30d (as the API's `expires`), or never.
     expires: String,
     #[serde(default)]
     page: String,
 }
 
-/// Change when one of the signed-in user's files or notes stops working,
+/// Change when one of the signed-in user's files, notes or short links stops working,
 /// then go back to the same page of /my. A note's files go with it; a file
 /// in a note can't be set apart from it.
 async fn my_expire(
@@ -1093,14 +1090,16 @@ async fn my_expire(
         Ok(at) => at,
         Err(m) => return front_error(StatusCode::BAD_REQUEST, &m),
     };
-    // Its link, whether it is a note, and for a file, the note it is in.
-    let found: Option<(i64, bool, Option<String>)> = match sqlx::query_as(
-        "SELECT l.id, p.link_id IS NOT NULL, nl.short_code
+    // Its link, its kind, and for a file, the note it is in.
+    let found: Option<(i64, String, Option<String>)> = match sqlx::query_as(
+        "SELECT l.id, l.kind, nl.short_code
          FROM links l
          LEFT JOIN files f ON f.link_id = l.id
          LEFT JOIN pastes p ON p.link_id = l.id
+         LEFT JOIN short_links s ON s.link_id = l.id
          LEFT JOIN links nl ON nl.id = f.note_link_id
-         WHERE l.short_code = $1 AND (f.uploaded_by = $2 OR p.created_by = $2)
+         WHERE l.short_code = $1
+           AND (f.uploaded_by = $2 OR p.created_by = $2 OR s.created_by = $2)
            AND (l.expires_at IS NULL OR l.expires_at > now())",
     )
     .bind(&form.code)
@@ -1111,26 +1110,28 @@ async fn my_expire(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
     };
-    let set = match found {
-        None => return front_error(StatusCode::NOT_FOUND, "nothing of yours with that code"),
-        Some((_, false, Some(note))) => {
+    let Some((link_id, kind, note)) = found else {
+        return front_error(StatusCode::NOT_FOUND, "nothing of yours with that code");
+    };
+    let tab = match kind.as_str() {
+        links::KIND_CODE => "notes",
+        links::KIND_URL => "links",
+        _ => "files",
+    };
+    let set = match note {
+        Some(note) => {
             let msg = format!(
                 "{} expires with its note, {note}: change it there",
                 form.code
             );
             return front_error(StatusCode::CONFLICT, &msg);
         }
-        Some((link_id, true, _)) => links::set_note_expiry(&st.pool, link_id, expires_at).await,
-        Some((link_id, false, None)) => links::set_expiry(&st.pool, link_id, expires_at).await,
+        None if tab == "notes" => links::set_note_expiry(&st.pool, link_id, expires_at).await,
+        None => links::set_expiry(&st.pool, link_id, expires_at).await,
     };
     if let Err(e) = set {
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("expiry: {e}"));
     }
-    let tab = if form.tab == "notes" {
-        "notes"
-    } else {
-        "files"
-    };
     let page = form.page.parse::<i64>().unwrap_or(1).max(1);
     let code =
         percent_encoding::utf8_percent_encode(&form.code, percent_encoding::NON_ALPHANUMERIC);
@@ -1153,7 +1154,8 @@ async fn my_stuff(
              WHERE f.uploaded_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())),
            (SELECT COUNT(*) FROM pastes p JOIN links l ON l.id = p.link_id
              WHERE p.created_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())),
-           (SELECT COUNT(*) FROM short_links WHERE created_by = $1)",
+           (SELECT COUNT(*) FROM short_links sl JOIN links l ON l.id = sl.link_id
+             WHERE sl.created_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now()))",
     )
     .bind(pw_id)
     .fetch_one(pool)
@@ -1193,10 +1195,10 @@ async fn my_stuff(
                 .collect()
         }
         "links" => {
-            let rows: Vec<(String, String, At)> = sqlx::query_as(
-                "SELECT l.short_code, sl.destination_url, sl.created_at
+            let rows: Vec<(String, String, At, Option<At>)> = sqlx::query_as(
+                "SELECT l.short_code, sl.destination_url, sl.created_at, l.expires_at
                  FROM short_links sl JOIN links l ON l.id = sl.link_id
-                 WHERE sl.created_by = $1
+                 WHERE sl.created_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())
                  ORDER BY sl.created_at DESC
                  LIMIT $2 OFFSET $3",
             )
@@ -1206,7 +1208,12 @@ async fn my_stuff(
             .fetch_all(pool)
             .await?;
             rows.into_iter()
-                .map(|(code, dest, at)| context! { code => code, destination => dest, at => when(at) })
+                .map(|(code, dest, at, expires)| {
+                    context! {
+                        code => code, destination => dest, at => when(at),
+                        expires => expires.map(when),
+                    }
+                })
                 .collect()
         }
         _ => {
@@ -1276,6 +1283,9 @@ struct ShortenForm {
     #[serde(default)]
     password: String,
     url: String,
+    /// When the short link stops working, as the front page's shared choice.
+    #[serde(default)]
+    expires: String,
 }
 
 async fn shorten(
@@ -1304,9 +1314,19 @@ async fn shorten(
         );
         return session::with_cookie(page, auth.set_cookie);
     }
+    let expires_at = match expiry_choice(&form.expires) {
+        Ok(at) => at,
+        Err(m) => {
+            let page = front(
+                StatusCode::BAD_REQUEST,
+                context! { error => m, signed_in => auth.label },
+            );
+            return session::with_cookie(page, auth.set_cookie);
+        }
+    };
     let (pw_id, pw_label) = (auth.id, auth.label.clone());
 
-    let (link_id, code) = match links::allocate(&st.pool, links::KIND_URL).await {
+    let (link_id, code) = match links::allocate_until(&st.pool, links::KIND_URL, expires_at).await {
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")),
     };
@@ -1334,6 +1354,8 @@ async fn shorten(
             result_url => short_url,
             result_destination => url,
             qr_svg => qr_svg,
+            result_code => code,
+            result_expires => expires_at.map(when),
         },
     );
     session::with_cookie(page, auth.set_cookie)
