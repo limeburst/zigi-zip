@@ -33,7 +33,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 {% endblock %}
 {% block body %}
 {% macro expiry_options(selected="1d") %}{% for v, t in [("1h", "in 1 hour"), ("1d", "in 1 day"), ("7d", "in 7 days"), ("30d", "in 30 days"), ("never", "never")] %}<option value="{{ v }}"{% if v == selected %} selected{% endif %}>{{ "expires " ~ t if v != "never" else "never expires" }}</option>{% endfor %}{% endmacro %}
-<h1>zigi.zip</h1>
+<h1><a href="/">zigi.zip</a></h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 

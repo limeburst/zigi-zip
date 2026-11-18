@@ -11,3 +11,4 @@ button { padding: 0.6rem 1rem; font: inherit; cursor: pointer; border-radius: 0;
 button:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
 .hint { opacity: 0.6; font-size: 0.85rem; }
 a { word-break: break-all; }
+h1 a { color: inherit; text-decoration: none; }
