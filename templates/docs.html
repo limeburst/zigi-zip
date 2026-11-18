@@ -1,0 +1,62 @@
+{% extends "layout.html" %}
+{% block extra_css %}
+pre { overflow-x: auto; padding: 0.75rem; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); font-size: 0.85rem; }
+h2 { font-size: 1rem; margin-top: 2rem; }
+table { border-collapse: collapse; font-size: 0.85rem; }
+td, th { text-align: left; padding: 0.25rem 0.75rem 0.25rem 0; vertical-align: top; }
+code { font-size: 0.9em; }
+{% endblock %}
+{% block body %}
+<h1><a href="/" style="color: inherit; text-decoration: none">zigi.zip</a> · API</h1>
+<p class="hint">signed in as <strong>{{ signed_in }}</strong></p>
+
+<p>Upload files from scripts. Each upload gets a link with a long, unguessable code that stops working after {{ default_days }} days, or when you say.</p>
+
+<h2>Sign in</h2>
+<p>Send your upload password in the <code>Authorization</code> header, the same password you sign in with here:</p>
+<pre>Authorization: Bearer &lt;password&gt;</pre>
+<p class="hint">An API request leaves no session behind. Revoking or rotating the password stops scripts that use it.</p>
+
+<h2>Upload a file</h2>
+<p>Send the file as the body of a PUT, named in the URL:</p>
+<pre>curl -H "Authorization: Bearer $ZIGI_PASSWORD" \
+     -T app.zip {{ base_url }}/api/files/app.zip</pre>
+<p>or as the <code>file</code> field of a multipart POST, as a browser form would:</p>
+<pre>curl -H "Authorization: Bearer $ZIGI_PASSWORD" \
+     -F file=@app.zip {{ base_url }}/api/files</pre>
+<p>From PowerShell, where there is no curl:</p>
+<pre>Invoke-RestMethod -Method Put -InFile app.zip `
+  -Headers @{ Authorization = "Bearer $env:ZIGI_PASSWORD" } `
+  -Uri {{ base_url }}/api/files/app.zip</pre>
+
+<h2>How long the link lasts</h2>
+<p>{{ default_days }} days unless you add <code>?expires=</code>: a number with <code>m</code>, <code>h</code> or <code>d</code>, from 1 minute to {{ max_days }} days.</p>
+<pre>curl -H "Authorization: Bearer $ZIGI_PASSWORD" \
+     -T app.zip "{{ base_url }}/api/files/app.zip?expires=2h"</pre>
+<p class="hint">After that, the link answers 404, and the file is deleted within a few minutes (unless another link has the same file).</p>
+
+<h2>The answer</h2>
+<p>The link, on a line of its own (status 201):</p>
+<pre>{{ base_url }}/Xk7pQ2mNa9cRtE4wYb8s</pre>
+<p>With <code>Accept: application/json</code>, the details too:</p>
+<pre>{
+  "url": "{{ base_url }}/Xk7pQ2mNa9cRtE4wYb8s",
+  "code": "Xk7pQ2mNa9cRtE4wYb8s",
+  "name": "app.zip",
+  "size": 1048576,
+  "sha256": "9f86d08…",
+  "expires_at": "2026-11-25T13:00:00+00:00"
+}</pre>
+<p>Check what you download against <code>sha256</code>:</p>
+<pre>curl -fsSLo app.zip {{ base_url }}/Xk7pQ2mNa9cRtE4wYb8s
+shasum -a 256 app.zip                     # macOS, Linux
+Get-FileHash app.zip -Algorithm SHA256    # PowerShell</pre>
+
+<h2>Errors</h2>
+<table>
+  <tr><th>401</th><td>no password, or a wrong one</td></tr>
+  <tr><th>400</th><td>no file, a bad name, or a bad <code>expires</code></td></tr>
+  <tr><th>502</th><td>storage did not take the file; try again</td></tr>
+</table>
+<p class="hint">The body says what went wrong: <code>error: …</code>, or <code>{"error": "…"}</code> with JSON.</p>
+{% endblock %}

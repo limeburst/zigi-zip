@@ -55,8 +55,10 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         pool,
         pastes: paste::Registry::default(),
     };
+    tokio::spawn(purge_expired(state.clone()));
     let app = Router::new()
         .route("/", get(root))
+        .route("/docs", get(docs))
         .route(
             "/file",
             get(to_front)
@@ -64,6 +66,14 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/code", get(to_front).post(create_paste))
+        .route(
+            "/api/files",
+            axum::routing::post(api_upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/files/:name",
+            axum::routing::put(api_put).layer(DefaultBodyLimit::disable()),
+        )
         .route("/admin", get(admin_login).post(admin_view))
         .route("/admin/delete", axum::routing::post(admin_delete))
         .route("/admin/cache/clear", axum::routing::post(admin_cache_clear))
@@ -1251,6 +1261,23 @@ async fn spool(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "file".into());
     let content_type = field.content_type().map(|s| s.to_string());
+    spool_stream(field, tmp, cap, original_name, content_type).await
+}
+
+/// Spool any stream of bytes -- a multipart field, or a request's whole
+/// body -- as `spool` does.
+async fn spool_stream<S, E>(
+    stream: S,
+    tmp: PathBuf,
+    cap: Option<i64>,
+    original_name: String,
+    content_type: Option<String>,
+) -> std::result::Result<Spooled, SpoolError>
+where
+    S: futures::Stream<Item = std::result::Result<axum::body::Bytes, E>>,
+    E: std::fmt::Display,
+{
+    let mut field = std::pin::pin!(stream);
     let mut f = File::create(&tmp)
         .await
         .map_err(|e| SpoolError::Io(format!("create tmp: {e}")))?;
@@ -1296,6 +1323,8 @@ struct Uploader {
     /// Set for files added through a note's link without a password.
     note_link_id: Option<i64>,
     via_link: bool,
+    /// Set for the API's uploads: a long code that stops working then.
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Move a spooled file into R2 and give it a link. Returns its short code.
@@ -1327,9 +1356,12 @@ async fn store_spooled(
         }
     };
 
-    let (link_id, code) = links::allocate(&st.pool, links::KIND_FILE)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")))?;
+    let allocated = match who.expires_at {
+        Some(at) => links::allocate_expiring(&st.pool, links::KIND_FILE, at).await,
+        None => links::allocate(&st.pool, links::KIND_FILE).await,
+    };
+    let (link_id, code) =
+        allocated.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")))?;
 
     let insert = sqlx::query(
         "INSERT INTO files (link_id, original_name, object_key, content_type, size_bytes,
@@ -1407,6 +1439,7 @@ async fn upload(State(st): State<AppState>, headers: HeaderMap, mut mp: Multipar
         label: auth.label.clone(),
         note_link_id: None,
         via_link: false,
+        expires_at: None,
     };
     let code = match store_spooled(&st, s, &who).await {
         Ok(c) => c,
@@ -1571,6 +1604,7 @@ async fn note_upload_inner(
                         label: a.label,
                         note_link_id: Some(note.link_id),
                         via_link: false,
+                        expires_at: None,
                     }
                 } else if !password.is_empty() {
                     return json_err(StatusCode::UNAUTHORIZED, "invalid password");
@@ -1580,6 +1614,7 @@ async fn note_upload_inner(
                         label: format!("{} (via {})", note.owner_label, code),
                         note_link_id: Some(note.link_id),
                         via_link: true,
+                        expires_at: None,
                     }
                 } else {
                     return json_err(
@@ -1706,4 +1741,330 @@ fn qr_svg(url: &str) -> Option<String> {
 
 fn err(code: StatusCode, msg: String) -> Response {
     (code, msg).into_response()
+}
+
+// ---------- upload API ----------
+//
+// For scripts: the same uploads as the front page, signed in with an upload
+// password in the Authorization header (`Bearer <password>`) instead of a
+// session, so a request leaves no session behind. Its links have long,
+// unguessable codes and expire: after a week, or `?expires=` (30m, 12h, 3d;
+// at most 30 days). The answer is the file's URL as a line of text, or JSON
+// when the request accepts it. /docs says all this to a signed-in browser.
+//
+//     curl -H "Authorization: Bearer $PW" -T photo.jpg https://zigi.zip/api/files/photo.jpg
+//     curl -H "Authorization: Bearer $PW" -F file=@photo.jpg https://zigi.zip/api/files
+
+/// The upload password in the request's Authorization header.
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = v.trim().split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then(|| token.to_string())
+}
+
+fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("application/json"))
+}
+
+/// An API answer: `text` as a line of text, or `value` as JSON.
+fn api_reply(
+    headers: &HeaderMap,
+    status: StatusCode,
+    text: String,
+    value: serde_json::Value,
+) -> Response {
+    if wants_json(headers) {
+        (status, Json(value)).into_response()
+    } else {
+        (
+            status,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!("{text}\n"),
+        )
+            .into_response()
+    }
+}
+
+fn api_error(headers: &HeaderMap, status: StatusCode, msg: &str) -> Response {
+    let mut res = api_reply(
+        headers,
+        status,
+        format!("error: {msg}"),
+        json!({ "error": msg }),
+    );
+    if status == StatusCode::UNAUTHORIZED {
+        res.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Bearer realm=\"zigi.zip\""),
+        );
+    }
+    res
+}
+
+/// How long an API upload's link lasts, by default and at most.
+const API_EXPIRY_DEFAULT: i64 = 7 * 86400;
+const API_EXPIRY_MAX: i64 = 30 * 86400;
+
+#[derive(Deserialize, Default)]
+struct ApiQuery {
+    expires: Option<String>,
+}
+
+/// `expires` (30m, 12h, 7d, or seconds) as seconds, within the limits.
+fn parse_expiry(v: Option<&str>) -> std::result::Result<i64, String> {
+    let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(API_EXPIRY_DEFAULT);
+    };
+    let (digits, unit) = match v.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => (&v[..i], &v[i..]),
+        None => (v, "s"),
+    };
+    let per = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => 0,
+    };
+    let n: i64 = digits.parse().unwrap_or(0);
+    let secs = n.saturating_mul(per);
+    if per == 0 || !(60..=API_EXPIRY_MAX).contains(&secs) {
+        return Err("expires is from 1m to 30d, as 30m, 12h or 7d".into());
+    }
+    Ok(secs)
+}
+
+/// Who the request's password signs it in as, or the answer to give.
+async fn api_auth(
+    st: &AppState,
+    headers: &HeaderMap,
+    query: &ApiQuery,
+) -> std::result::Result<Uploader, Box<Response>> {
+    let expires_in = parse_expiry(query.expires.as_deref())
+        .map_err(|m| Box::new(api_error(headers, StatusCode::BAD_REQUEST, &m)))?;
+    let Some(password) = bearer(headers) else {
+        return Err(Box::new(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            "send an upload password: Authorization: Bearer <password>",
+        )));
+    };
+    match passwd::verify_password(&st.pool, &password).await {
+        Ok(Some((id, label))) => Ok(Uploader {
+            by: Some(id),
+            label,
+            note_link_id: None,
+            via_link: false,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(expires_in)),
+        }),
+        Ok(None) => Err(Box::new(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            "invalid password",
+        ))),
+        Err(e) => Err(Box::new(api_error(
+            headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("auth: {e}"),
+        ))),
+    }
+}
+
+/// Store a spooled file and answer with its URL.
+async fn api_store(st: &AppState, headers: &HeaderMap, s: Spooled, who: &Uploader) -> Response {
+    let (name, size, hash) = (s.original_name.clone(), s.size, s.content_hash.clone());
+    let expires_at = who.expires_at.map(|t| t.to_rfc3339());
+    match store_spooled(st, s, who).await {
+        Ok(code) => {
+            let url = format!("{}/{}", st.cfg.base_url.trim_end_matches('/'), code);
+            api_reply(
+                headers,
+                StatusCode::CREATED,
+                url.clone(),
+                json!({
+                    "url": url, "code": code, "name": name, "size": size,
+                    "sha256": hash, "expires_at": expires_at,
+                }),
+            )
+        }
+        Err((status, msg)) => api_error(headers, status, &msg),
+    }
+}
+
+/// POST /api/files: a multipart form with a `file` field.
+async fn api_upload(
+    State(st): State<AppState>,
+    Query(query): Query<ApiQuery>,
+    headers: HeaderMap,
+    mut mp: Multipart,
+) -> Response {
+    // Checked before the body is read, so a wrong password costs no upload.
+    let who = match api_auth(&st, &headers, &query).await {
+        Ok(w) => w,
+        Err(res) => return *res,
+    };
+    let mut spooled: Option<Spooled> = None;
+    loop {
+        let mut field = match mp.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                discard(&spooled).await;
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    &format!("multipart: {e}"),
+                );
+            }
+        };
+        if field.name() != Some("file") {
+            continue;
+        }
+        match spool(&mut field, spool_path(&st), None).await {
+            Ok(s) => {
+                if let Some(old) = spooled.replace(s) {
+                    let _ = tokio::fs::remove_file(&old.tmp).await;
+                }
+            }
+            Err(SpoolError::Io(m)) => {
+                discard(&spooled).await;
+                return api_error(&headers, StatusCode::INTERNAL_SERVER_ERROR, &m);
+            }
+            Err(SpoolError::TooLarge) => unreachable!("no cap"),
+        }
+    }
+    let Some(s) = spooled else {
+        return api_error(&headers, StatusCode::BAD_REQUEST, "no file field");
+    };
+    api_store(&st, &headers, s, &who).await
+}
+
+/// PUT /api/files/<name>: the request's body is the file, named <name>.
+async fn api_put(
+    State(st): State<AppState>,
+    AxPath(name): AxPath<String>,
+    Query(query): Query<ApiQuery>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let who = match api_auth(&st, &headers, &query).await {
+        Ok(w) => w,
+        Err(res) => return *res,
+    };
+    let name = name.trim();
+    if name.is_empty() || name.len() > 255 || name.contains(['/', '\\']) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "name the file in the URL: /api/files/<name>",
+        );
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let s = match spool_stream(
+        body.into_data_stream(),
+        spool_path(&st),
+        None,
+        name.to_string(),
+        content_type,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(SpoolError::Io(m)) => {
+            return api_error(&headers, StatusCode::INTERNAL_SERVER_ERROR, &m)
+        }
+        Err(SpoolError::TooLarge) => unreachable!("no cap"),
+    };
+    api_store(&st, &headers, s, &who).await
+}
+
+/// Delete links past their expiry, every few minutes, for as long as the
+/// server runs; their files go too, when no other link has them.
+async fn purge_expired(st: AppState) {
+    let mut every = tokio::time::interval(std::time::Duration::from_secs(300));
+    loop {
+        every.tick().await;
+        let codes = match links::expired(&st.pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(?e, "could not list expired links");
+                continue;
+            }
+        };
+        for code in codes {
+            match delete_link(&st, &code).await {
+                Ok(_) => tracing::info!(%code, "deleted an expired link"),
+                Err(e) => tracing::warn!(%code, ?e, "could not delete an expired link"),
+            }
+        }
+    }
+}
+
+// ---------- docs ----------
+
+/// The API's documentation, for a signed-in browser.
+async fn docs(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let signed_in = match session::current(&st.pool, &headers).await {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let Some(s) = signed_in else {
+        return front_error(StatusCode::UNAUTHORIZED, "sign in to read the API docs");
+    };
+    Html(templates::render(
+        "docs.html",
+        context! {
+            title => "zigi.zip · API",
+            signed_in => s.label,
+            base_url => st.cfg.base_url.trim_end_matches('/'),
+            default_days => API_EXPIRY_DEFAULT / 86400,
+            max_days => API_EXPIRY_MAX / 86400,
+        },
+    ))
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry() {
+        assert_eq!(parse_expiry(None), Ok(API_EXPIRY_DEFAULT));
+        assert_eq!(parse_expiry(Some("")), Ok(API_EXPIRY_DEFAULT));
+        assert_eq!(parse_expiry(Some("30m")), Ok(1800));
+        assert_eq!(parse_expiry(Some("12h")), Ok(43200));
+        assert_eq!(parse_expiry(Some("30d")), Ok(API_EXPIRY_MAX));
+        assert_eq!(parse_expiry(Some("3600")), Ok(3600));
+        for bad in [
+            "31d",
+            "59s",
+            "0m",
+            "2w",
+            "h",
+            "-1d",
+            "1.5h",
+            "99999999999999999999d",
+        ] {
+            assert!(parse_expiry(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn bearer_token() {
+        let mut h = HeaderMap::new();
+        assert_eq!(bearer(&h), None);
+        h.insert(header::AUTHORIZATION, "Bearer two words".parse().unwrap());
+        assert_eq!(bearer(&h).as_deref(), Some("two words"));
+        h.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        assert_eq!(bearer(&h), None);
+    }
 }

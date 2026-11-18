@@ -43,7 +43,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 
 {% if signed_in %}
 <form method="post" action="/signout" id="signout" style="display: none"></form>
-<p class="hint">signed in as <strong>{{ signed_in }}</strong> · <button type="submit" form="signout">sign out</button></p>
+<p class="hint">signed in as <strong>{{ signed_in }}</strong> · <a href="/docs">API</a> · <button type="submit" form="signout">sign out</button></p>
 {% endif %}
 
 <form method="post" action="/file" enctype="multipart/form-data">
