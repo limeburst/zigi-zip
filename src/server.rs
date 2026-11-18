@@ -1531,12 +1531,15 @@ async fn store_spooled(
 }
 
 /// When a link chosen on a form (or in "my stuff") stops working: never, or
-/// after one of `parse_expiry`'s lengths.
+/// after one of `parse_expiry`'s lengths. A form that doesn't say gets the
+/// API's default, a day, as every new link does unless told otherwise.
 fn expiry_choice(v: &str) -> std::result::Result<Option<At>, String> {
-    match v.trim() {
-        "" | "never" => Ok(None),
-        v => parse_expiry(Some(v)).map(|s| Some(chrono::Utc::now() + chrono::Duration::seconds(s))),
-    }
+    let secs = match v.trim() {
+        "never" => return Ok(None),
+        "" => API_EXPIRY_DEFAULT,
+        v => parse_expiry(Some(v))?,
+    };
+    Ok(Some(chrono::Utc::now() + chrono::Duration::seconds(secs)))
 }
 
 async fn upload(State(st): State<AppState>, headers: HeaderMap, mut mp: Multipart) -> Response {
@@ -2274,7 +2277,9 @@ mod tests {
             context! { title => "t", result_kind => "uploaded", result_url => "u", result_code => "Abc" },
         );
         assert!(never.contains("expires never"));
-        assert!(never.contains(r#"<option value="never" selected>"#));
+        // Every expiry choice starts at a day.
+        assert!(!never.contains(r#"<option value="never" selected>"#));
+        assert!(never.contains(r#"<option value="1d" selected>"#));
     }
 
     #[test]
