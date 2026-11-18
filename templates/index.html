@@ -24,7 +24,7 @@ form.inline { display: inline; margin: 0; padding: 0; border: 0; }
 form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
 td.act { text-align: right; }
 form.expire { white-space: nowrap; }
-fieldset select, .actions select { font: inherit; padding: 0.5rem; border-radius: 0; border: 1px solid color-mix(in srgb, currentColor 40%, transparent); background: transparent; color: inherit; }
+fieldset select { font: inherit; padding: 0.5rem; border-radius: 0; border: 1px solid color-mix(in srgb, currentColor 40%, transparent); background: transparent; color: inherit; }
 form.expire select { font: inherit; font-size: 0.8rem; padding: 0.1rem; margin: 0 0.25rem 0 0.5rem; border-radius: 0; }
 .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
 h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25rem; }
@@ -65,10 +65,14 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
   </fieldset>
   {% endif %}
 
+  <div class="row-label">uploads and new notes</div>
+  <fieldset>
+    <select name="expires" id="expires" aria-label="uploads and new notes expire" title="when an upload's link, or a new note and the files put in it, stop working">{{ expiry_options("never") }}</select>
+  </fieldset>
+
   <div class="row-label">upload a file, get a short link</div>
   <fieldset>
     <input type="file" name="file" id="file">
-    <select name="expires" aria-label="link expires" title="when the link stops working">{{ expiry_options("never") }}</select>
     <button type="submit" formaction="/file" formenctype="multipart/form-data" id="upload-btn">upload</button>
   </fieldset>
 
@@ -80,7 +84,6 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 
   <div class="row-label">more</div>
   <div class="actions">
-    <select name="note_expires" aria-label="note expires" title="when the note, and the files put in it, stop working">{{ expiry_options("never") }}</select>
     <button type="submit" formaction="/code" formenctype="application/x-www-form-urlencoded">new collaborative note</button>
     <button type="submit" formaction="/my" formenctype="application/x-www-form-urlencoded">my stuff</button>
   </div>

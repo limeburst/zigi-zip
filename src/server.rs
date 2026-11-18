@@ -693,9 +693,9 @@ struct PasteForm {
     #[serde(default)]
     password: String,
     /// When the note (and the files put in it) stop working: never, 1h, 1d,
-    /// 7d or 30d.
-    #[serde(default)]
-    note_expires: String,
+    /// 7d or 30d. The front page's one choice, shared with its uploads.
+    #[serde(default, alias = "note_expires")]
+    expires: String,
 }
 
 async fn create_paste(
@@ -709,7 +709,7 @@ async fn create_paste(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")).into_response(),
     };
     let (pw_id, pw_label) = (auth.id, auth.label);
-    let expires_at = match expiry_choice(&form.note_expires) {
+    let expires_at = match expiry_choice(&form.expires) {
         Ok(at) => at,
         Err(m) => {
             let page = front(
