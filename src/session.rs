@@ -94,6 +94,21 @@ pub async fn end_all_for(pool: &PgPool, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// End every session, signing every browser out; returns how many there were.
+pub async fn end_all(pool: &PgPool) -> Result<u64> {
+    Ok(sqlx::query("DELETE FROM sessions")
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
+/// How many sessions there are, past their age or not.
+pub async fn count(pool: &PgPool) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM sessions")
+        .fetch_one(pool)
+        .await?)
+}
+
 // SameSite=Lax keeps other sites' forms from posting as the signed-in user.
 fn cookie(value: &str, max_age: i64, secure: bool) -> String {
     format!(

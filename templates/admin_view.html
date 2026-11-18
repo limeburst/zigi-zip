@@ -98,6 +98,13 @@ form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
 </form>
 {% else %}<p class="hint">off (no [cache] section in the config)</p>{% endif %}
 
+<h2>sessions ({{ sessions }})</h2>
+<p class="hint">browsers signed in with a password. ending them signs every browser out; the passwords stay as they are.</p>
+<form class="inline" method="post" action="/admin/sessions/end-all" onsubmit="return confirm('sign every browser out?')">
+  <input type="hidden" name="password" value="{{ password }}">
+  <button type="submit">end all sessions</button>
+</form>
+
 <h2>passwords ({{ passwords | length }})</h2>
 <table>
   <thead><tr><th>label</th><th>created</th><th>revoked</th><th>admin</th><th></th></tr></thead>

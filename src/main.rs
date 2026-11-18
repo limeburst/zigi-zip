@@ -40,8 +40,19 @@ enum Command {
         #[command(subcommand)]
         action: PasswdAction,
     },
+    /// Manage sign-in sessions
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
     /// Run database migrations
     Migrate,
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// End every session: each browser has to give its password again
+    EndAll,
 }
 
 #[derive(Subcommand)]
@@ -104,6 +115,12 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve => server::run(cfg, pool).await?,
         Command::Migrate => db::migrate(&pool).await?,
+        Command::Sessions { action } => match action {
+            SessionsAction::EndAll => {
+                let n = session::end_all(&pool).await?;
+                println!("Ended {n} sessions");
+            }
+        },
         Command::Passwd { action } => match action {
             PasswdAction::Add {
                 label,

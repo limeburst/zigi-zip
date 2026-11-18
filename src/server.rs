@@ -67,6 +67,10 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/admin", get(admin_login).post(admin_view))
         .route("/admin/delete", axum::routing::post(admin_delete))
         .route("/admin/cache/clear", axum::routing::post(admin_cache_clear))
+        .route(
+            "/admin/sessions/end-all",
+            axum::routing::post(admin_sessions_end_all),
+        )
         .route("/admin/passwd/add", axum::routing::post(admin_passwd_add))
         .route(
             "/admin/passwd/revoke",
@@ -281,6 +285,22 @@ async fn admin_cache_clear(State(st): State<AppState>, Form(form): Form<AdminFor
         None => "the disk cache is off".to_string(),
     };
     render_admin(&st, &form.password, &admin_label, Some(msg)).await
+}
+
+async fn admin_sessions_end_all(
+    State(st): State<AppState>,
+    Form(form): Form<AdminForm>,
+) -> Response {
+    let admin_label = match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some((_, l))) => l,
+        Ok(None) => return admin_invalid_response(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let flash = match session::end_all(&st.pool).await {
+        Ok(n) => format!("ended {n} sessions: every browser is signed out"),
+        Err(e) => format!("ending sessions failed: {e}"),
+    };
+    render_admin(&st, &form.password, &admin_label, Some(flash)).await
 }
 
 /// Bytes as megabytes with one decimal, for the admin page.
@@ -615,6 +635,10 @@ async fn render_admin(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("passwords: {e}")),
     };
+    let sessions = match session::count(&st.pool).await {
+        Ok(n) => n,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("sessions: {e}")),
+    };
     let passwords_ctx: Vec<_> = passwords
         .into_iter()
         .map(|(label, created, revoked, admin)| {
@@ -639,6 +663,7 @@ async fn render_admin(
             pastes => pastes_ctx,
             short_links => short_links_ctx,
             passwords => passwords_ctx,
+            sessions => sessions,
             cache => st.cache.as_ref().map(|c| {
                 let u = c.usage();
                 context! {
