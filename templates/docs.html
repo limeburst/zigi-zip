@@ -47,6 +47,7 @@ code { font-size: 0.9em; }
   "sha256": "9f86d08…",
   "expires_at": "2026-11-25T13:00:00+00:00"
 }</pre>
+<p>A browser shows what it can (images, PDFs, text) and saves the rest. Add <code>?download</code> to the link to have it always saved: <code>{{ base_url }}/k7m3x9qp2t?download</code>. curl and PowerShell always save it.</p>
 <p>Check what you download against <code>sha256</code>:</p>
 <pre>curl -fsSLo app.zip {{ base_url }}/k7m3x9qp2t
 shasum -a 256 app.zip                     # macOS, Linux

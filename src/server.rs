@@ -732,10 +732,21 @@ async fn create_paste(
     )
 }
 
-async fn dispatch_code(State(st): State<AppState>, AxPath(code): AxPath<String>) -> Response {
+/// `?download` on a file's link: always save it, never show it in the
+/// browser.
+#[derive(Deserialize, Default)]
+struct FileQuery {
+    download: Option<String>,
+}
+
+async fn dispatch_code(
+    State(st): State<AppState>,
+    AxPath(code): AxPath<String>,
+    Query(q): Query<FileQuery>,
+) -> Response {
     match links::lookup(&st.pool, &code).await {
         Ok(Some((link_id, kind))) => match kind.as_str() {
-            "file" => serve_file(&st, link_id).await,
+            "file" => serve_file(&st, link_id, q.download.is_some()).await,
             "code" => serve_paste_editor(&st, &code).await,
             "url" => serve_redirect(&st, link_id).await,
             _ => (StatusCode::NOT_FOUND, "unknown kind").into_response(),
@@ -747,16 +758,21 @@ async fn dispatch_code(State(st): State<AppState>, AxPath(code): AxPath<String>)
 async fn dispatch_code_with_rest(
     State(st): State<AppState>,
     AxPath((code, _rest)): AxPath<(String, String)>,
+    Query(q): Query<FileQuery>,
 ) -> Response {
     match links::lookup(&st.pool, &code).await {
-        Ok(Some((link_id, kind))) if kind == "file" => serve_file(&st, link_id).await,
+        Ok(Some((link_id, kind))) if kind == "file" => {
+            serve_file(&st, link_id, q.download.is_some()).await
+        }
         Ok(Some((_, kind))) if kind == "code" => serve_paste_editor(&st, &code).await,
         Ok(Some((link_id, kind))) if kind == "url" => serve_redirect(&st, link_id).await,
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
-async fn serve_file(st: &AppState, link_id: i64) -> Response {
+/// A file: shown in the browser when it can be, or, with `download` (and
+/// always for one that came in through a note's link), saved.
+async fn serve_file(st: &AppState, link_id: i64, download: bool) -> Response {
     let row: Option<(String, String, Option<String>, i64, bool)> = match sqlx::query_as(
         "SELECT original_name, object_key, content_type, size_bytes, via_link FROM files WHERE link_id = $1",
     )
@@ -789,7 +805,11 @@ async fn serve_file(st: &AppState, link_id: i64) -> Response {
     let encoded =
         percent_encoding::utf8_percent_encode(&original_name, percent_encoding::NON_ALPHANUMERIC)
             .to_string();
-    let disposition = if via_link { "attachment" } else { "inline" };
+    let disposition = if via_link || download {
+        "attachment"
+    } else {
+        "inline"
+    };
     let disp = format!("{disposition}; filename*=UTF-8''{}", encoded);
     let mut res = Response::builder()
         .status(StatusCode::OK)
@@ -1506,12 +1526,13 @@ async fn notify_files_changed(st: &AppState, note_link_id: i64) {
 async fn note_files(
     State(st): State<AppState>,
     AxPath(code): AxPath<String>,
+    Query(q): Query<FileQuery>,
     headers: HeaderMap,
 ) -> Response {
     let note = match note_by_code(&st.pool, &code).await {
         Ok(Some(n)) => n,
         // Not a note: this is a file link with a name after it, as before.
-        Ok(None) => return dispatch_code(State(st), AxPath(code)).await,
+        Ok(None) => return dispatch_code(State(st), AxPath(code), Query(q)).await,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
     };
     let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
