@@ -46,33 +46,47 @@ pub async fn allocate(pool: &PgPool, kind: &str) -> Result<(i64, String)> {
     }
 }
 
-/// How long a long code is: 20 of the 57 letters, about 117 bits, which no
-/// one guesses.
-pub const LONG_LEN: usize = 20;
+/// How long an expiring link's code is: 10 of the 31 typeable letters,
+/// about 50 bits, which no one guesses within its expiry, and which someone
+/// can still type by hand (on a machine with no clipboard to paste it into).
+pub const TYPEABLE_LEN: usize = 10;
 
-/// Allocate a link with a long code that stops working at `expires_at`.
+/// Allocate a link with a typeable code that stops working at `expires_at`.
 pub async fn allocate_expiring(
     pool: &PgPool,
     kind: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(i64, String)> {
-    let code = shortcode::generate(LONG_LEN);
-    let (id,): (i64,) = sqlx::query_as(
-        "INSERT INTO links (short_code, kind, expires_at) VALUES ($1, $2, $3) RETURNING id",
-    )
-    .bind(&code)
-    .bind(kind)
-    .bind(expires_at)
-    .fetch_one(pool)
-    .await?;
-    Ok((id, code))
+    loop {
+        let code = shortcode::generate_typeable(TYPEABLE_LEN);
+        let res: std::result::Result<(i64,), sqlx::Error> = sqlx::query_as(
+            "INSERT INTO links (short_code, kind, expires_at) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(&code)
+        .bind(kind)
+        .bind(expires_at)
+        .fetch_one(pool)
+        .await;
+        match res {
+            Ok((id,)) => return Ok((id, code)),
+            Err(sqlx::Error::Database(dbe)) if dbe.constraint() == Some("links_short_code_key") => {
+                continue
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
-/// (link_id, kind) for a short code, if any, and not past its expiry.
+/// (link_id, kind) for a short code, if any, and not past its expiry. An
+/// expiring link's code (all lowercase) matches typed in any case, since it
+/// is typed by hand; other codes match exactly, and first.
 pub async fn lookup(pool: &PgPool, code: &str) -> Result<Option<(i64, String)>> {
     let row: Option<(i64, String)> = sqlx::query_as(
         "SELECT id, kind FROM links
-         WHERE short_code = $1 AND (expires_at IS NULL OR expires_at > now())",
+         WHERE (short_code = $1 OR (expires_at IS NOT NULL AND short_code = lower($1)))
+           AND (expires_at IS NULL OR expires_at > now())
+         ORDER BY short_code = $1 DESC
+         LIMIT 1",
     )
     .bind(code)
     .fetch_optional(pool)

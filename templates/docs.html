@@ -10,7 +10,7 @@ code { font-size: 0.9em; }
 <h1><a href="/" style="color: inherit; text-decoration: none">zigi.zip</a> · API</h1>
 <p class="hint">signed in as <strong>{{ signed_in }}</strong></p>
 
-<p>Upload files from scripts. Each upload gets a link with a long, unguessable code that stops working after {{ default_days }} days, or when you say.</p>
+<p>Upload files from scripts. Each upload gets a link that stops working after {{ default_days }} days, or when you say. Its code is 10 lowercase letters and digits, without look-alikes (no 0, o, 1, l or i), so you can type it by hand where you can't paste; case doesn't matter. No one can guess it.</p>
 
 <h2>Sign in</h2>
 <p>Send your upload password in the <code>Authorization</code> header, the same password you sign in with here:</p>
@@ -37,18 +37,18 @@ code { font-size: 0.9em; }
 
 <h2>The answer</h2>
 <p>The link, on a line of its own (status 201):</p>
-<pre>{{ base_url }}/Xk7pQ2mNa9cRtE4wYb8s</pre>
+<pre>{{ base_url }}/k7m3x9qp2t</pre>
 <p>With <code>Accept: application/json</code>, the details too:</p>
 <pre>{
-  "url": "{{ base_url }}/Xk7pQ2mNa9cRtE4wYb8s",
-  "code": "Xk7pQ2mNa9cRtE4wYb8s",
+  "url": "{{ base_url }}/k7m3x9qp2t",
+  "code": "k7m3x9qp2t",
   "name": "app.zip",
   "size": 1048576,
   "sha256": "9f86d08…",
   "expires_at": "2026-11-25T13:00:00+00:00"
 }</pre>
 <p>Check what you download against <code>sha256</code>:</p>
-<pre>curl -fsSLo app.zip {{ base_url }}/Xk7pQ2mNa9cRtE4wYb8s
+<pre>curl -fsSLo app.zip {{ base_url }}/k7m3x9qp2t
 shasum -a 256 app.zip                     # macOS, Linux
 Get-FileHash app.zip -Algorithm SHA256    # PowerShell</pre>
 

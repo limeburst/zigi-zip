@@ -1747,8 +1747,8 @@ fn err(code: StatusCode, msg: String) -> Response {
 //
 // For scripts: the same uploads as the front page, signed in with an upload
 // password in the Authorization header (`Bearer <password>`) instead of a
-// session, so a request leaves no session behind. Its links have long,
-// unguessable codes and expire: after a week, or `?expires=` (30m, 12h, 3d;
+// session, so a request leaves no session behind. Its links have codes of 10
+// lowercase letters and digits, typeable by hand and unguessable, and expire: after a week, or `?expires=` (30m, 12h, 3d;
 // at most 30 days). The answer is the file's URL as a line of text, or JSON
 // when the request accepts it. /docs says all this to a signed-in browser.
 //
