@@ -111,7 +111,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
       <td><a href="/{{ f.code }}">{{ f.code }}</a></td>
       <td class="num">{{ f.size }}</td>
       <td>{{ at(f.at) }}</td>
-      <td>{% if f.note %}{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %} <span class="hint" title="files in a note expire with it">with {{ f.note }}</span>{% else %}<form class="inline expire" method="post" action="/my/expire">{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %}
+      <td>{% if f.note %}{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %} <span class="hint" title="files in a note expire with it">with <a href="/{{ f.note }}">{{ f.note }}</a></span>{% else %}<form class="inline expire" method="post" action="/my/expire">{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %}
         <input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="files"><input type="hidden" name="page" value="{{ mine.page }}">
         <select name="expires" aria-label="when {{ f.code }} expires">{{ expiry_options() }}</select><button type="submit">set</button></form>{% endif %}</td>
       <td>{% if f.note %}<a href="/{{ f.note }}">{{ f.note }}</a>{% endif %}</td>
