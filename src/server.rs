@@ -321,7 +321,32 @@ fn mb(bytes: u64) -> String {
 
 /// Delete the link with `code` and — for file links — remove the R2 object
 /// only when no other links still reference that `object_key`.
+/// Delete a link, and for a note, the files in it: they expire with it, so
+/// they go when it is deleted too.
 async fn delete_link(st: &AppState, code: &str) -> anyhow::Result<String> {
+    let files: Vec<String> = sqlx::query_scalar(
+        "SELECT fl.short_code
+         FROM links l
+         JOIN files f ON f.note_link_id = l.id
+         JOIN links fl ON fl.id = f.link_id
+         WHERE l.short_code = $1 AND l.kind = $2",
+    )
+    .bind(code)
+    .bind(links::KIND_CODE)
+    .fetch_all(&st.pool)
+    .await?;
+    for file in &files {
+        delete_one_link(st, file).await?;
+    }
+    let msg = delete_one_link(st, code).await?;
+    Ok(match files.len() {
+        0 => msg,
+        1 => format!("{msg} and the file in it"),
+        n => format!("{msg} and the {n} files in it"),
+    })
+}
+
+async fn delete_one_link(st: &AppState, code: &str) -> anyhow::Result<String> {
     let link: Option<(i64, String)> =
         sqlx::query_as("SELECT id, kind FROM links WHERE short_code = $1")
             .bind(code)

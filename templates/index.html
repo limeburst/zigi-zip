@@ -136,7 +136,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
       <td><form class="inline expire" method="post" action="/my/expire">{% if n.expires %}{{ at(n.expires) }}{% else %}never{% endif %}
         <input type="hidden" name="code" value="{{ n.code }}"><input type="hidden" name="tab" value="notes"><input type="hidden" name="page" value="{{ mine.page }}">
         <select name="expires" aria-label="when note {{ n.code }} and its files expire">{{ expiry_options() }}</select><button type="submit">set</button></form></td>
-      <td class="act"><form class="inline" method="post" action="/my/delete" data-confirm="delete note {{ n.code }} and its text? files in it are kept. this can't be undone."><input type="hidden" name="code" value="{{ n.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
+      <td class="act"><form class="inline" method="post" action="/my/delete" data-confirm="delete note {{ n.code }} and its text{% if n.files == 1 %}, and the file in it{% elif n.files %}, and the {{ n.files }} files in it{% endif %}? {% if n.files %}their links stop working. {% endif %}this can't be undone."><input type="hidden" name="code" value="{{ n.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>
   {% endfor %}
   </tbody>
