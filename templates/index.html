@@ -24,6 +24,7 @@ form.inline { display: inline; margin: 0; padding: 0; border: 0; }
 form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
 td.act { text-align: right; }
 form.expire { white-space: nowrap; }
+fieldset select { font: inherit; padding: 0.5rem; border-radius: 0; border: 1px solid color-mix(in srgb, currentColor 40%, transparent); background: transparent; color: inherit; }
 form.expire select { font: inherit; font-size: 0.8rem; padding: 0.1rem; margin: 0 0.25rem 0 0.5rem; border-radius: 0; }
 .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
 h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25rem; }
@@ -31,6 +32,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 .tag { font-size: 0.75rem; opacity: 0.7; border: 1px solid currentColor; padding: 0 0.3rem; white-space: nowrap; }
 {% endblock %}
 {% block body %}
+{% macro expiry_options(selected="1d") %}{% for v, t in [("1h", "in 1 hour"), ("1d", "in 1 day"), ("7d", "in 7 days"), ("30d", "in 30 days"), ("never", "never")] %}<option value="{{ v }}"{% if v == selected %} selected{% endif %}>{{ "expires " ~ t if v != "never" else "never expires" }}</option>{% endfor %}{% endmacro %}
 <h1>zigi.zip</h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
@@ -39,6 +41,13 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 <div class="result">
   <p>{{ result_kind }}: <a href="{{ result_url }}">{{ result_url }}</a></p>
   {% if result_destination %}<p class="hint">→ {{ result_destination }}</p>{% endif %}
+  {% if result_code %}
+  <form class="inline expire" method="post" action="/my/expire">
+    <span class="hint">expires {% if result_expires %}<time datetime="{{ result_expires.iso }}" title="{{ result_expires.text }}">{{ result_expires.text }}</time>{% else %}never{% endif %} · change to</span>
+    <input type="hidden" name="code" value="{{ result_code }}"><input type="hidden" name="page" value="1">
+    <select name="expires" aria-label="when {{ result_code }} expires">{{ expiry_options() }}</select><button type="submit">set</button>
+  </form>
+  {% endif %}
   {% if qr_svg %}<div class="qr">{{ qr_svg | safe }}</div>{% endif %}
 </div>
 {% endif %}
@@ -59,6 +68,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
   <div class="row-label">upload a file, get a short link</div>
   <fieldset>
     <input type="file" name="file" id="file">
+    <select name="expires" aria-label="link expires" title="when the link stops working">{{ expiry_options("never") }}</select>
     <button type="submit" formaction="/file" formenctype="multipart/form-data" id="upload-btn">upload</button>
   </fieldset>
 
@@ -99,7 +109,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
       <td>{{ at(f.at) }}</td>
       <td><form class="inline expire" method="post" action="/my/expire">{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %}
         <input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="page" value="{{ mine.page }}">
-        <select name="expires" aria-label="when {{ f.code }} expires"><option value="1h">in 1 hour</option><option value="1d">in 1 day</option><option value="7d">in 7 days</option><option value="30d">in 30 days</option><option value="never">never</option></select><button type="submit">set</button></form></td>
+        <select name="expires" aria-label="when {{ f.code }} expires">{{ expiry_options() }}</select><button type="submit">set</button></form></td>
       <td>{% if f.note %}<a href="/{{ f.note }}">{{ f.note }}</a>{% endif %}</td>
       <td class="act"><a href="/{{ f.code }}?download" download>download</a> <form class="inline" method="post" action="/my/delete" data-confirm="delete {{ f.name }} ({{ f.code }})? its link stops working. this can't be undone."><input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>

@@ -1070,13 +1070,9 @@ async fn my_expire(
         Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "sign in to change that"),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
-    let expires_at = if form.expires == "never" {
-        None
-    } else {
-        match parse_expiry(Some(&form.expires)) {
-            Ok(secs) => Some(chrono::Utc::now() + chrono::Duration::seconds(secs)),
-            Err(m) => return front_error(StatusCode::BAD_REQUEST, &m),
-        }
+    let expires_at = match expiry_choice(&form.expires) {
+        Ok(at) => at,
+        Err(m) => return front_error(StatusCode::BAD_REQUEST, &m),
     };
     let link_id: Option<i64> = match sqlx::query_scalar(
         "SELECT l.id FROM links l JOIN files f ON f.link_id = l.id
@@ -1469,13 +1465,24 @@ async fn store_spooled(
     Ok(code)
 }
 
+/// When a link chosen on a form (or in "my stuff") stops working: never, or
+/// after one of `parse_expiry`'s lengths.
+fn expiry_choice(v: &str) -> std::result::Result<Option<At>, String> {
+    match v.trim() {
+        "" | "never" => Ok(None),
+        v => parse_expiry(Some(v)).map(|s| Some(chrono::Utc::now() + chrono::Duration::seconds(s))),
+    }
+}
+
 async fn upload(State(st): State<AppState>, headers: HeaderMap, mut mp: Multipart) -> Response {
     let mut password = String::new();
+    let mut expires = String::new();
     let mut spooled: Option<Spooled> = None;
 
     while let Ok(Some(mut field)) = mp.next_field().await {
         match field.name().unwrap_or("") {
             "password" => password = field.text().await.unwrap_or_default(),
+            "expires" => expires = field.text().await.unwrap_or_default(),
             "file" => match spool(&mut field, spool_path(&st), None).await {
                 Ok(s) => {
                     if let Some(old) = spooled.replace(s) {
@@ -1511,12 +1518,23 @@ async fn upload(State(st): State<AppState>, headers: HeaderMap, mut mp: Multipar
         return session::with_cookie(page, auth.set_cookie);
     };
 
+    let expires_at = match expiry_choice(&expires) {
+        Ok(at) => at,
+        Err(m) => {
+            let _ = tokio::fs::remove_file(&s.tmp).await;
+            let page = front(
+                StatusCode::BAD_REQUEST,
+                context! { error => m, signed_in => auth.label },
+            );
+            return session::with_cookie(page, auth.set_cookie);
+        }
+    };
     let who = Uploader {
         by: Some(auth.id),
         label: auth.label.clone(),
         note_link_id: None,
         via_link: false,
-        expires_at: None,
+        expires_at,
     };
     let code = match store_spooled(&st, s, &who).await {
         Ok(c) => c,
@@ -1527,7 +1545,10 @@ async fn upload(State(st): State<AppState>, headers: HeaderMap, mut mp: Multipar
     let qr_svg = qr_svg(&url).unwrap_or_default();
     let page = front(
         StatusCode::OK,
-        context! { signed_in => auth.label, result_kind => "uploaded", result_url => url, qr_svg => qr_svg },
+        context! {
+            signed_in => auth.label, result_kind => "uploaded", result_url => url, qr_svg => qr_svg,
+            result_code => code, result_expires => expires_at.map(when),
+        },
     );
     session::with_cookie(page, auth.set_cookie)
 }
@@ -2134,6 +2155,26 @@ mod tests {
         ] {
             assert!(parse_expiry(Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn upload_result_offers_expiry() {
+        let page = templates::render(
+            "index.html",
+            context! {
+                title => "t", signed_in => "tester", result_kind => "uploaded",
+                result_url => "https://zigi.zip/Abc", result_code => "Abc",
+                result_expires => when(chrono::Utc::now()),
+            },
+        );
+        assert!(page.contains(r#"<input type="hidden" name="code" value="Abc">"#));
+        assert!(page.contains("expires <time"));
+        let never = templates::render(
+            "index.html",
+            context! { title => "t", result_kind => "uploaded", result_url => "u", result_code => "Abc" },
+        );
+        assert!(never.contains("expires never"));
+        assert!(never.contains(r#"<option value="never" selected>"#));
     }
 
     #[test]
