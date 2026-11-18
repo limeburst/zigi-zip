@@ -23,6 +23,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 form.inline { display: inline; margin: 0; padding: 0; border: 0; }
 form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
 td.act { text-align: right; }
+form.expire { white-space: nowrap; }
+form.expire select { font: inherit; font-size: 0.8rem; padding: 0.1rem; margin: 0 0.25rem 0 0.5rem; border-radius: 0; }
 .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
 h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25rem; }
 .scroll { overflow-x: auto; }
@@ -76,6 +78,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 {% if mine %}
 {% macro at(t) %}<time datetime="{{ t.iso }}" title="{{ t.text }}">{{ t.text }}</time>{% endmacro %}
 {% if deleted %}<p class="hint" role="status">deleted {{ deleted }}</p>{% endif %}
+{% if expiry %}<p class="hint" role="status">changed when {{ expiry }} expires</p>{% endif %}
 <nav class="tabs" aria-label="my stuff">
   <a href="/my?tab=files"{% if mine.tab == "files" %} aria-current="page"{% endif %}>files <span class="count">{{ mine.counts.files }}</span></a>
   <a href="/my?tab=notes"{% if mine.tab == "notes" %} aria-current="page"{% endif %}>notes <span class="count">{{ mine.counts.notes }}</span></a>
@@ -86,7 +89,7 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 {% if mine.rows %}
 <p class="hint">{{ mine.counts.files }} files · {{ mine.files_total }} in all</p>
 <div class="scroll"><table>
-  <thead><tr><th>filename</th><th>code</th><th class="num">size</th><th>uploaded</th><th>in note</th><th></th></tr></thead>
+  <thead><tr><th>filename</th><th>code</th><th class="num">size</th><th>uploaded</th><th>expires</th><th>in note</th><th></th></tr></thead>
   <tbody>
   {% for f in mine.rows %}
     <tr>
@@ -94,6 +97,9 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
       <td><a href="/{{ f.code }}">{{ f.code }}</a></td>
       <td class="num">{{ f.size }}</td>
       <td>{{ at(f.at) }}</td>
+      <td><form class="inline expire" method="post" action="/my/expire">{% if f.expires %}{{ at(f.expires) }}{% else %}never{% endif %}
+        <input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="page" value="{{ mine.page }}">
+        <select name="expires" aria-label="when {{ f.code }} expires"><option value="1h">in 1 hour</option><option value="1d">in 1 day</option><option value="7d">in 7 days</option><option value="30d">in 30 days</option><option value="never">never</option></select><button type="submit">set</button></form></td>
       <td>{% if f.note %}<a href="/{{ f.note }}">{{ f.note }}</a>{% endif %}</td>
       <td class="act"><a href="/{{ f.code }}?download" download>download</a> <form class="inline" method="post" action="/my/delete" data-confirm="delete {{ f.name }} ({{ f.code }})? its link stops working. this can't be undone."><input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
     </tr>

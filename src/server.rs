@@ -98,6 +98,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         .route("/signout", axum::routing::post(sign_out))
         .route("/my", get(my_view).post(my_post))
         .route("/my/delete", axum::routing::post(my_delete))
+        .route("/my/expire", axum::routing::post(my_expire))
         .route("/url", get(to_front).post(shorten))
         .route("/:code", get(dispatch_code))
         .route("/:code/ws", get(paste_ws))
@@ -951,6 +952,8 @@ struct MyQuery {
     page: Option<String>,
     /// Set after a delete, to say what went.
     deleted: Option<String>,
+    /// Set after an expiry is changed, to say whose.
+    expiry: Option<String>,
 }
 
 /// Rows per page on /my.
@@ -981,7 +984,7 @@ async fn my_view(
     match my_stuff(&st.pool, me.id, tab, page).await {
         Ok(mine) => front(
             StatusCode::OK,
-            context! { signed_in => me.label, mine => mine, deleted => q.deleted },
+            context! { signed_in => me.label, mine => mine, deleted => q.deleted, expiry => q.expiry },
         ),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("my stuff: {e}")),
     }
@@ -1046,6 +1049,60 @@ async fn my_delete(
     Redirect::to(&format!("/my?tab={tab}&page={page}&deleted={deleted}")).into_response()
 }
 
+#[derive(Deserialize)]
+struct MyExpireForm {
+    code: String,
+    /// 1h, 1d, 7d, 30d (as the API's `expires`), or never.
+    expires: String,
+    #[serde(default)]
+    page: String,
+}
+
+/// Change when one of the signed-in user's files stops working, then go
+/// back to the same page of /my.
+async fn my_expire(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<MyExpireForm>,
+) -> Response {
+    let me = match session::current(&st.pool, &headers).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return front_error(StatusCode::UNAUTHORIZED, "sign in to change that"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let expires_at = if form.expires == "never" {
+        None
+    } else {
+        match parse_expiry(Some(&form.expires)) {
+            Ok(secs) => Some(chrono::Utc::now() + chrono::Duration::seconds(secs)),
+            Err(m) => return front_error(StatusCode::BAD_REQUEST, &m),
+        }
+    };
+    let link_id: Option<i64> = match sqlx::query_scalar(
+        "SELECT l.id FROM links l JOIN files f ON f.link_id = l.id
+         WHERE l.short_code = $1 AND f.uploaded_by = $2
+           AND (l.expires_at IS NULL OR l.expires_at > now())",
+    )
+    .bind(&form.code)
+    .bind(me.id)
+    .fetch_optional(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
+    };
+    let Some(link_id) = link_id else {
+        return front_error(StatusCode::NOT_FOUND, "no file of yours with that code");
+    };
+    if let Err(e) = links::set_expiry(&st.pool, link_id, expires_at).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("expiry: {e}"));
+    }
+    let page = form.page.parse::<i64>().unwrap_or(1).max(1);
+    let code =
+        percent_encoding::utf8_percent_encode(&form.code, percent_encoding::NON_ALPHANUMERIC);
+    Redirect::to(&format!("/my?tab=files&page={page}&expiry={code}")).into_response()
+}
+
 type At = chrono::DateTime<chrono::Utc>;
 
 async fn my_stuff(
@@ -1056,8 +1113,10 @@ async fn my_stuff(
 ) -> anyhow::Result<minijinja::Value> {
     let (n_files, files_bytes, n_notes, n_links): (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
-           (SELECT COUNT(*) FROM files WHERE uploaded_by = $1),
-           (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM files WHERE uploaded_by = $1),
+           (SELECT COUNT(*) FROM files f JOIN links l ON l.id = f.link_id
+             WHERE f.uploaded_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())),
+           (SELECT COALESCE(SUM(f.size_bytes), 0)::BIGINT FROM files f JOIN links l ON l.id = f.link_id
+             WHERE f.uploaded_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())),
            (SELECT COUNT(*) FROM pastes WHERE created_by = $1),
            (SELECT COUNT(*) FROM short_links WHERE created_by = $1)",
     )
@@ -1112,13 +1171,14 @@ async fn my_stuff(
                 .collect()
         }
         _ => {
-            let rows: Vec<(String, String, i64, At, Option<String>, bool)> = sqlx::query_as(
+            type Row = (String, String, i64, At, Option<String>, bool, Option<At>);
+            let rows: Vec<Row> = sqlx::query_as(
                 "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at,
-                        nl.short_code, f.via_link
+                        nl.short_code, f.via_link, l.expires_at
                  FROM files f
                  JOIN links l ON l.id = f.link_id
                  LEFT JOIN links nl ON nl.id = f.note_link_id
-                 WHERE f.uploaded_by = $1
+                 WHERE f.uploaded_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())
                  ORDER BY f.uploaded_at DESC
                  LIMIT $2 OFFSET $3",
             )
@@ -1128,10 +1188,10 @@ async fn my_stuff(
             .fetch_all(pool)
             .await?;
             rows.into_iter()
-                .map(|(code, name, size, at, note, via_link)| {
+                .map(|(code, name, size, at, note, via_link, expires)| {
                     context! {
                         code => code, name => name, size => human_size(size), at => when(at),
-                        note => note, via_link => via_link,
+                        note => note, via_link => via_link, expires => expires.map(when),
                     }
                 })
                 .collect()
@@ -1343,7 +1403,7 @@ struct Uploader {
     /// Set for files added through a note's link without a password.
     note_link_id: Option<i64>,
     via_link: bool,
-    /// Set for the API's uploads: a long code that stops working then.
+    /// When the file's link stops working: the API's uploads, by default.
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -1376,12 +1436,9 @@ async fn store_spooled(
         }
     };
 
-    let allocated = match who.expires_at {
-        Some(at) => links::allocate_expiring(&st.pool, links::KIND_FILE, at).await,
-        None => links::allocate(&st.pool, links::KIND_FILE).await,
-    };
-    let (link_id, code) =
-        allocated.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")))?;
+    let (link_id, code) = links::allocate_until(&st.pool, links::KIND_FILE, who.expires_at)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("alloc: {e}")))?;
 
     let insert = sqlx::query(
         "INSERT INTO files (link_id, original_name, object_key, content_type, size_bytes,
@@ -1768,9 +1825,9 @@ fn err(code: StatusCode, msg: String) -> Response {
 //
 // For scripts: the same uploads as the front page, signed in with an upload
 // password in the Authorization header (`Bearer <password>`) instead of a
-// session, so a request leaves no session behind. Its links have codes of 10
-// lowercase letters and digits, typeable by hand and unguessable, and expire: after a week, or `?expires=` (30m, 12h, 3d;
-// at most 30 days). The answer is the file's URL as a line of text, or JSON
+// session, so a request leaves no session behind. Its links are short codes,
+// as the front page's, and expire: after a day, or `?expires=` (30m, 12h, 3d;
+// at most 30 days), which "my stuff" can change later. The answer is the file's URL as a line of text, or JSON
 // when the request accepts it. /docs says all this to a signed-in browser.
 //
 //     curl -H "Authorization: Bearer $PW" -T photo.jpg https://zigi.zip/api/files/photo.jpg
@@ -1827,7 +1884,7 @@ fn api_error(headers: &HeaderMap, status: StatusCode, msg: &str) -> Response {
 }
 
 /// How long an API upload's link lasts, by default and at most.
-const API_EXPIRY_DEFAULT: i64 = 7 * 86400;
+const API_EXPIRY_DEFAULT: i64 = 86400;
 const API_EXPIRY_MAX: i64 = 30 * 86400;
 
 #[derive(Deserialize, Default)]
