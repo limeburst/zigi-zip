@@ -76,6 +76,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
         )
         .route("/admin", get(admin_login).post(admin_view))
         .route("/admin/delete", axum::routing::post(admin_delete))
+        .route("/admin/more", axum::routing::post(admin_more))
         .route("/admin/cache/clear", axum::routing::post(admin_cache_clear))
         .route(
             "/admin/sessions/end-all",
@@ -109,6 +110,7 @@ pub async fn run(cfg: Config, pool: PgPool) -> Result<()> {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/:code/settings", axum::routing::post(note_settings))
+        .route("/:code/files/delete", axum::routing::post(note_file_delete))
         .route("/:code/:rest", get(dispatch_code_with_rest))
         .with_state(state);
 
@@ -240,6 +242,9 @@ async fn admin_login() -> Html<String> {
 #[derive(Deserialize)]
 struct AdminForm {
     password: String,
+    /// Filters the file list by filename, code or uploader.
+    #[serde(default)]
+    q: String,
 }
 
 async fn admin_view(State(st): State<AppState>, Form(form): Form<AdminForm>) -> Response {
@@ -254,13 +259,15 @@ async fn admin_view(State(st): State<AppState>, Form(form): Form<AdminForm>) -> 
         }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
     };
-    render_admin(&st, &form.password, &admin_label, None).await
+    render_admin_search(&st, &form.password, &admin_label, None, &form.q).await
 }
 
 #[derive(Deserialize)]
 struct AdminDeleteForm {
     password: String,
     code: String,
+    #[serde(default)]
+    q: String,
 }
 
 async fn admin_delete(State(st): State<AppState>, Form(form): Form<AdminDeleteForm>) -> Response {
@@ -279,7 +286,7 @@ async fn admin_delete(State(st): State<AppState>, Form(form): Form<AdminDeleteFo
         Ok(m) => m,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}")),
     };
-    render_admin(&st, &form.password, &admin_label, Some(msg)).await
+    render_admin_search(&st, &form.password, &admin_label, Some(msg), &form.q).await
 }
 
 async fn admin_cache_clear(State(st): State<AppState>, Form(form): Form<AdminForm>) -> Response {
@@ -582,80 +589,216 @@ fn admin_invalid_response() -> Response {
     .into_response()
 }
 
+/// Rows per list on the admin page, and per "more" fetch as it scrolls.
+const ADMIN_PAGE: i64 = 100;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdminList {
+    Files,
+    Notes,
+    Links,
+}
+
+impl AdminList {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "files" => Some(Self::Files),
+            "notes" => Some(Self::Notes),
+            "links" => Some(Self::Links),
+            _ => None,
+        }
+    }
+}
+
+/// One page of an admin list: its rows, how many there are in all (matching
+/// the search, for files), and where the next page starts if there is one.
+struct AdminPage {
+    rows: Vec<minijinja::Value>,
+    total: i64,
+    next: Option<i64>,
+}
+
+impl AdminPage {
+    fn ctx(&self) -> minijinja::Value {
+        context! { rows => self.rows.clone(), total => self.total, next => self.next }
+    }
+}
+
+/// `ADMIN_PAGE` rows of one admin list from `offset`, newest first. The
+/// search narrows only the files.
+async fn admin_list(
+    pool: &PgPool,
+    list: AdminList,
+    q: &str,
+    offset: i64,
+) -> anyhow::Result<AdminPage> {
+    let offset = offset.max(0);
+    let (rows, total): (Vec<minijinja::Value>, i64) = match list {
+        AdminList::Files => {
+            let filter = format!(
+                "({} OR strpos(lower(f.created_by_label), lower($1)) > 0)",
+                file_match(1)
+            );
+            let total: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM files f JOIN links l ON l.id = f.link_id WHERE {filter}"
+            ))
+            .bind(q)
+            .fetch_one(pool)
+            .await?;
+            let rows: Vec<(String, String, i64, At, String)> = sqlx::query_as(&format!(
+                "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at, f.created_by_label
+                 FROM files f JOIN links l ON l.id = f.link_id
+                 WHERE {filter}
+                 ORDER BY f.uploaded_at DESC, f.link_id DESC
+                 LIMIT $2 OFFSET $3"
+            ))
+            .bind(q)
+            .bind(ADMIN_PAGE)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+            let rows = rows
+                .into_iter()
+                .map(|(code, name, size, at, by)| {
+                    context! {
+                        code => code, original_name => name, size_bytes => size,
+                        uploaded_at => at.to_rfc3339(), created_by_label => by,
+                    }
+                })
+                .collect();
+            (rows, total)
+        }
+        AdminList::Notes => {
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pastes")
+                .fetch_one(pool)
+                .await?;
+            let rows: Vec<(String, At, String)> = sqlx::query_as(
+                "SELECT l.short_code, p.updated_at, p.created_by_label
+                 FROM pastes p JOIN links l ON l.id = p.link_id
+                 ORDER BY p.updated_at DESC, p.link_id DESC
+                 LIMIT $1 OFFSET $2",
+            )
+            .bind(ADMIN_PAGE)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+            let rows = rows
+                .into_iter()
+                .map(|(code, at, by)| {
+                    context! { code => code, updated_at => at.to_rfc3339(), created_by_label => by }
+                })
+                .collect();
+            (rows, total)
+        }
+        AdminList::Links => {
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM short_links")
+                .fetch_one(pool)
+                .await?;
+            let rows: Vec<(String, String, At, String)> = sqlx::query_as(
+                "SELECT l.short_code, sl.destination_url, sl.created_at, sl.created_by_label
+                 FROM short_links sl JOIN links l ON l.id = sl.link_id
+                 ORDER BY sl.created_at DESC, sl.link_id DESC
+                 LIMIT $1 OFFSET $2",
+            )
+            .bind(ADMIN_PAGE)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+            let rows = rows
+                .into_iter()
+                .map(|(code, dest, at, by)| {
+                    context! {
+                        code => code, destination_url => dest,
+                        created_at => at.to_rfc3339(), created_by_label => by,
+                    }
+                })
+                .collect();
+            (rows, total)
+        }
+    };
+    let end = offset + rows.len() as i64;
+    Ok(AdminPage {
+        rows,
+        total,
+        next: (end < total).then_some(end),
+    })
+}
+
+#[derive(Deserialize)]
+struct AdminMoreForm {
+    password: String,
+    list: String,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default)]
+    q: String,
+}
+
+/// The admin page's infinite scroll: the next rows of one list, as HTML
+/// table rows, and where the page after starts.
+async fn admin_more(State(st): State<AppState>, Form(form): Form<AdminMoreForm>) -> Response {
+    match passwd::verify_admin(&st.pool, &form.password).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "invalid admin password"),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    }
+    let Some(list) = AdminList::parse(&form.list) else {
+        return json_err(StatusCode::BAD_REQUEST, "unknown list");
+    };
+    let q = q_trimmed(Some(&form.q));
+    let page = match admin_list(&st.pool, list, &q, form.offset).await {
+        Ok(p) => p,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("list: {e}")),
+    };
+    let html = templates::render(
+        "admin_more.html",
+        context! { list => form.list, rows => page.rows, password => form.password, q => q },
+    );
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "html": html, "next": page.next })),
+    )
+        .into_response()
+}
+
 async fn render_admin(
     st: &AppState,
     password: &str,
     admin_label: &str,
     flash: Option<String>,
 ) -> Response {
-    let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>, String)> =
-        match sqlx::query_as(
-            "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at, f.created_by_label
-         FROM files f JOIN links l ON l.id = f.link_id
-         ORDER BY f.uploaded_at DESC",
-        )
-        .fetch_all(&st.pool)
-        .await
+    render_admin_search(st, password, admin_label, flash, "").await
+}
+
+/// The admin page, its file list narrowed to those whose filename, code or
+/// uploader holds `q`.
+async fn render_admin_search(
+    st: &AppState,
+    password: &str,
+    admin_label: &str,
+    flash: Option<String>,
+    q: &str,
+) -> Response {
+    let q = q_trimmed(Some(q));
+    let mut lists = Vec::new();
+    for list in [AdminList::Files, AdminList::Notes, AdminList::Links] {
+        match admin_list(&st.pool, list, &q, 0).await {
+            Ok(v) => lists.push(v),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("lists: {e}")),
+        }
+    }
+    let [files, pastes, short_links]: [AdminPage; 3] = lists.try_into().ok().unwrap();
+    let files_total: i64 = if q.is_empty() {
+        files.total
+    } else {
+        match sqlx::query_scalar("SELECT COUNT(*) FROM files")
+            .fetch_one(&st.pool)
+            .await
         {
-            Ok(v) => v,
+            Ok(n) => n,
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("files: {e}")),
-        };
-
-    let pastes: Vec<(String, chrono::DateTime<chrono::Utc>, String)> = match sqlx::query_as(
-        "SELECT l.short_code, p.updated_at, p.created_by_label
-         FROM pastes p JOIN links l ON l.id = p.link_id
-         ORDER BY p.updated_at DESC",
-    )
-    .fetch_all(&st.pool)
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("pastes: {e}")),
+        }
     };
-
-    let short_links: Vec<(String, String, chrono::DateTime<chrono::Utc>, String)> =
-        match sqlx::query_as(
-            "SELECT l.short_code, sl.destination_url, sl.created_at, sl.created_by_label
-             FROM short_links sl JOIN links l ON l.id = sl.link_id
-             ORDER BY sl.created_at DESC",
-        )
-        .fetch_all(&st.pool)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("short_links: {e}"),
-                )
-            }
-        };
-
-    let files_ctx: Vec<_> = files
-        .into_iter()
-        .map(|(code, name, size, at, by)| {
-            context! {
-                code => code, original_name => name, size_bytes => size,
-                uploaded_at => at.to_rfc3339(), created_by_label => by,
-            }
-        })
-        .collect();
-    let pastes_ctx: Vec<_> = pastes
-        .into_iter()
-        .map(|(code, at, by)| {
-            context! {
-                code => code, updated_at => at.to_rfc3339(), created_by_label => by,
-            }
-        })
-        .collect();
-    let short_links_ctx: Vec<_> = short_links
-        .into_iter()
-        .map(|(code, dest, at, by)| {
-            context! {
-                code => code, destination_url => dest, created_at => at.to_rfc3339(), created_by_label => by,
-            }
-        })
-        .collect();
 
     let passwords: Vec<(
         String,
@@ -695,9 +838,11 @@ async fn render_admin(
             admin_label => admin_label,
             password => password,
             flash => flash.unwrap_or_default(),
-            files => files_ctx,
-            pastes => pastes_ctx,
-            short_links => short_links_ctx,
+            files => files.ctx(),
+            files_total => files_total,
+            q => q,
+            pastes => pastes.ctx(),
+            short_links => short_links.ctx(),
             passwords => passwords_ctx,
             sessions => sessions,
             cache => st.cache.as_ref().map(|c| {
@@ -994,6 +1139,8 @@ struct MyQuery {
     deleted: Option<String>,
     /// Set after an expiry is changed, to say whose.
     expiry: Option<String>,
+    /// Filters the files tab by filename or code.
+    q: Option<String>,
 }
 
 /// Rows per page on /my.
@@ -1021,7 +1168,8 @@ async fn my_view(
         .and_then(|p| p.parse::<i64>().ok())
         .unwrap_or(1)
         .max(1);
-    match my_stuff(&st.pool, me.id, tab, page).await {
+    let search = q_trimmed(q.q.as_deref());
+    match my_stuff(&st.pool, me.id, tab, page, &search).await {
         Ok(mine) => front(
             StatusCode::OK,
             context! { signed_in => me.label, mine => mine, deleted => q.deleted, expiry => q.expiry },
@@ -1037,6 +1185,8 @@ struct MyDeleteForm {
     tab: String,
     #[serde(default)]
     page: String,
+    #[serde(default)]
+    q: String,
 }
 
 /// Delete one of the signed-in user's own files, notes or short links, then
@@ -1086,7 +1236,8 @@ async fn my_delete(
     // The code is from our own alphabet, but encode it anyway: it goes in a URL.
     let deleted =
         percent_encoding::utf8_percent_encode(&form.code, percent_encoding::NON_ALPHANUMERIC);
-    Redirect::to(&format!("/my?tab={tab}&page={page}&deleted={deleted}")).into_response()
+    let q = q_param(&form.q);
+    Redirect::to(&format!("/my?tab={tab}&page={page}{q}&deleted={deleted}")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1165,11 +1316,39 @@ async fn my_expire(
 
 type At = chrono::DateTime<chrono::Utc>;
 
+/// A search box's text, trimmed and capped so a pasted essay can't make a
+/// slow query; empty when there's no search.
+fn q_trimmed(q: Option<&str>) -> String {
+    q.unwrap_or("").trim().chars().take(200).collect()
+}
+
+/// `&q=…` for a URL back to a searched page, or nothing when there's no search.
+fn q_param(q: &str) -> String {
+    let q = q_trimmed(Some(q));
+    if q.is_empty() {
+        String::new()
+    } else {
+        let enc = percent_encoding::utf8_percent_encode(&q, percent_encoding::NON_ALPHANUMERIC);
+        format!("&q={enc}")
+    }
+}
+
+/// SQL matching a file by filename or code, case-insensitively, against the
+/// text in `$n`; an empty search matches every file. `strpos` rather than
+/// LIKE, so `%` and `_` in a search are just characters.
+fn file_match(n: u8) -> String {
+    format!(
+        "(strpos(lower(f.original_name), lower(${n})) > 0
+          OR strpos(lower(l.short_code), lower(${n})) > 0)"
+    )
+}
+
 async fn my_stuff(
     pool: &PgPool,
     pw_id: i64,
     tab: &str,
     page: i64,
+    q: &str,
 ) -> anyhow::Result<minijinja::Value> {
     let (n_files, files_bytes, n_notes, n_links): (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -1185,10 +1364,25 @@ async fn my_stuff(
     .bind(pw_id)
     .fetch_one(pool)
     .await?;
+    // Files matching the search; all of them when there is none.
+    let n_found: i64 = if q.is_empty() {
+        n_files
+    } else {
+        sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM files f JOIN links l ON l.id = f.link_id
+             WHERE f.uploaded_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())
+               AND {}",
+            file_match(2)
+        ))
+        .bind(pw_id)
+        .bind(q)
+        .fetch_one(pool)
+        .await?
+    };
     let total = match tab {
         "notes" => n_notes,
         "links" => n_links,
-        _ => n_files,
+        _ => n_found,
     };
     let pages = ((total + MY_PAGE - 1) / MY_PAGE).max(1);
     let page = page.min(pages);
@@ -1243,19 +1437,22 @@ async fn my_stuff(
         }
         _ => {
             type Row = (String, String, i64, At, Option<String>, bool, Option<At>);
-            let rows: Vec<Row> = sqlx::query_as(
+            let rows: Vec<Row> = sqlx::query_as(&format!(
                 "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at,
                         nl.short_code, f.via_link, l.expires_at
                  FROM files f
                  JOIN links l ON l.id = f.link_id
                  LEFT JOIN links nl ON nl.id = f.note_link_id
                  WHERE f.uploaded_by = $1 AND (l.expires_at IS NULL OR l.expires_at > now())
-                 ORDER BY f.uploaded_at DESC
+                   AND {}
+                 ORDER BY f.uploaded_at DESC, f.link_id DESC
                  LIMIT $2 OFFSET $3",
-            )
+                file_match(4)
+            ))
             .bind(pw_id)
             .bind(MY_PAGE)
             .bind(offset)
+            .bind(q)
             .fetch_all(pool)
             .await?;
             rows.into_iter()
@@ -1274,6 +1471,8 @@ async fn my_stuff(
         rows => rows,
         counts => context! { files => n_files, notes => n_notes, links => n_links },
         files_total => human_size(files_bytes),
+        q => q,
+        q_param => q_param(q),
         page => page,
         pages => pages,
         first => if total == 0 { 0 } else { offset + 1 },
@@ -1714,8 +1913,15 @@ async fn note_files(
         Ok(None) => return dispatch_code(State(st), AxPath(code), Query(q)).await,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
     };
-    let files: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
-        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at
+    type Row = (
+        String,
+        String,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+        Option<i64>,
+    );
+    let files: Vec<Row> = match sqlx::query_as(
+        "SELECT l.short_code, f.original_name, f.size_bytes, f.uploaded_at, f.uploaded_by
          FROM files f JOIN links l ON l.id = f.link_id
          WHERE f.note_link_id = $1 AND (l.expires_at IS NULL OR l.expires_at > now())
          ORDER BY f.uploaded_at",
@@ -1727,12 +1933,6 @@ async fn note_files(
         Ok(v) => v,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("files: {e}")),
     };
-    let files: Vec<_> = files
-        .into_iter()
-        .map(|(code, name, size, at)| {
-            json!({ "code": code, "name": name, "size": size, "uploaded_at": at.to_rfc3339() })
-        })
-        .collect();
     // Lets the page skip the password box for a signed-in browser, and show
     // owner settings as usable for its owner (or an admin).
     let me = match session::current(&st.pool, &headers).await {
@@ -1742,6 +1942,17 @@ async fn note_files(
     let can_manage = me
         .as_ref()
         .is_some_and(|m| note.owner == Some(m.id) || m.is_admin);
+    let files: Vec<_> = files
+        .into_iter()
+        .map(|(code, name, size, at, by)| {
+            // Its uploader can delete it too, as can whoever manages the note.
+            let can_delete = can_manage || (by.is_some() && by == me.as_ref().map(|m| m.id));
+            json!({
+                "code": code, "name": name, "size": size,
+                "uploaded_at": at.to_rfc3339(), "can_delete": can_delete,
+            })
+        })
+        .collect();
     (
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
@@ -1955,6 +2166,78 @@ async fn note_settings(
         .into_response(),
         set_cookie,
     )
+}
+
+#[derive(Deserialize)]
+struct NoteFileDeleteForm {
+    #[serde(default)]
+    password: String,
+    /// The file's own short code.
+    file: String,
+}
+
+/// Delete one file from a note. Its uploader can, and so can the note's owner
+/// or an admin; files uploaded through the link without a password are filed
+/// under the owner, so only the owner (or an admin) can delete those.
+async fn note_file_delete(
+    State(st): State<AppState>,
+    AxPath(code): AxPath<String>,
+    headers: HeaderMap,
+    Form(form): Form<NoteFileDeleteForm>,
+) -> Response {
+    let note = match note_by_code(&st.pool, &code).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return json_err(StatusCode::NOT_FOUND, "not found"),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
+    };
+    let auth = match authenticate(&st, &headers, &form.password).await {
+        Ok(Some(a)) => a,
+        Ok(None) if form.password.is_empty() => {
+            return json_err(
+                StatusCode::UNAUTHORIZED,
+                "enter your password to delete files",
+            )
+        }
+        Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "invalid password"),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("auth: {e}")),
+    };
+    let set_cookie = auth.set_cookie.clone();
+    let reply = |r: Response| session::with_cookie(r, set_cookie.clone());
+    let uploader: Option<Option<i64>> = match sqlx::query_scalar(
+        "SELECT f.uploaded_by FROM files f JOIN links l ON l.id = f.link_id
+         WHERE l.short_code = $1 AND f.note_link_id = $2",
+    )
+    .bind(&form.file)
+    .bind(note.link_id)
+    .fetch_optional(&st.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return reply(json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db: {e}"),
+            ))
+        }
+    };
+    let Some(uploader) = uploader else {
+        return reply(json_err(StatusCode::NOT_FOUND, "no such file in this note"));
+    };
+    let allowed = auth.is_admin || note.owner == Some(auth.id) || uploader == Some(auth.id);
+    if !allowed {
+        return reply(json_err(
+            StatusCode::FORBIDDEN,
+            "only whoever uploaded it, or the note's owner, can delete this file",
+        ));
+    }
+    if let Err(e) = delete_one_link(&st, &form.file).await {
+        return reply(json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("delete: {e}"),
+        ));
+    }
+    notify_files_changed(&st, note.link_id).await;
+    reply(Json(json!({ "deleted": form.file })).into_response())
 }
 
 fn qr_svg(url: &str) -> Option<String> {
@@ -2262,6 +2545,56 @@ async fn docs(State(st): State<AppState>, headers: HeaderMap) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_param_is_trimmed_and_encoded() {
+        assert_eq!(q_param("  "), "");
+        assert_eq!(q_param(" a b&c "), "&q=a%20b%26c");
+        assert_eq!(q_trimmed(Some(&"x".repeat(500))).len(), 200);
+    }
+
+    #[test]
+    fn admin_page_and_more_rows_render() {
+        let file = context! {
+            code => "Abc", original_name => "a<b>.txt", size_bytes => 3,
+            uploaded_at => "2026-01-01T00:00:00Z", created_by_label => "bob",
+        };
+        let page = templates::render(
+            "admin_view.html",
+            context! {
+                title => "t", admin_label => "alice", password => "pw", flash => "",
+                files => context! { rows => vec![file.clone()], total => 150, next => 100 },
+                files_total => 300, q => "a b",
+                pastes => context! { rows => Vec::<minijinja::Value>::new(), total => 0, next => () },
+                short_links => context! { rows => Vec::<minijinja::Value>::new(), total => 0, next => () },
+                passwords => Vec::<minijinja::Value>::new(), sessions => 0, cache => (),
+            },
+        );
+        assert!(page.contains("files (150 of 300)"));
+        assert!(page.contains(r#"data-list="files" data-next="100""#));
+        assert!(page.contains(r#"<input type="hidden" name="q" value="a b">"#));
+        assert!(page.contains("a&lt;b&gt;.txt"));
+        for list in ["files", "notes", "links"] {
+            let rows = templates::render(
+                "admin_more.html",
+                context! { list => list, rows => vec![file.clone()], password => "pw", q => "" },
+            );
+            assert!(rows.contains(r#"value="Abc""#), "{list}");
+        }
+    }
+
+    #[test]
+    fn my_files_search_renders() {
+        let mine = context! {
+            tab => "files", rows => Vec::<minijinja::Value>::new(),
+            counts => context! { files => 5, notes => 0, links => 0 },
+            files_total => "1 KB", q => "zz", q_param => "&q=zz",
+            page => 1, pages => 1, first => 0, last => 0, total => 0,
+        };
+        let page = templates::render("index.html", context! { signed_in => "bob", mine => mine });
+        assert!(page.contains(r#"name="q" value="zz""#));
+        assert!(page.contains("no files match"));
+    }
 
     #[test]
     fn expiry() {

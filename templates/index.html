@@ -29,6 +29,8 @@ form.expire select { font: inherit; font-size: 0.8rem; padding: 0.1rem; margin: 
 .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
 h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25rem; }
 .scroll { overflow-x: auto; }
+form.search { flex-direction: row; padding: 0; border: 0; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; align-items: center; }
+form.search input[type=search] { flex: 1 1 16rem; min-width: 0; padding: 0.5rem; font: inherit; border-radius: 0; border: 1px solid color-mix(in srgb, currentColor 40%, transparent); }
 .tag { font-size: 0.75rem; opacity: 0.7; border: 1px solid currentColor; padding: 0 0.3rem; white-space: nowrap; }
 {% endblock %}
 {% block body %}
@@ -100,8 +102,17 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 </nav>
 
 {% if mine.tab == "files" %}
+{% if mine.counts.files %}
+<form class="search" method="get" action="/my" role="search">
+  <input type="hidden" name="tab" value="files">
+  <input type="search" name="q" value="{{ mine.q }}" placeholder="search by filename or code" aria-label="search your files">
+  <button type="submit">search</button>
+  {% if mine.q %}<a href="/my?tab=files">clear</a>{% endif %}
+</form>
+{% endif %}
 {% if mine.rows %}
-<p class="hint">{{ mine.counts.files }} files · {{ mine.files_total }} in all</p>
+{% if mine.q %}<p class="hint">{{ mine.total }} of {{ mine.counts.files }} files match “{{ mine.q }}”</p>
+{% else %}<p class="hint">{{ mine.counts.files }} files · {{ mine.files_total }} in all</p>{% endif %}
 <div class="scroll"><table>
   <thead><tr><th>filename</th><th>code</th><th class="num">size</th><th>uploaded</th><th>expires</th><th>in note</th><th></th></tr></thead>
   <tbody>
@@ -115,11 +126,12 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
         <input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="files"><input type="hidden" name="page" value="{{ mine.page }}">
         <select name="expires" aria-label="when {{ f.code }} expires">{{ expiry_options() }}</select><button type="submit">set</button></form>{% endif %}</td>
       <td>{% if f.note %}<a href="/{{ f.note }}">{{ f.note }}</a>{% endif %}</td>
-      <td class="act"><a href="/{{ f.code }}?download" download>download</a> <form class="inline" method="post" action="/my/delete" data-confirm="delete {{ f.name }} ({{ f.code }})? its link stops working. this can't be undone."><input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><button type="submit">delete</button></form></td>
+      <td class="act"><a href="/{{ f.code }}?download" download>download</a> <form class="inline" method="post" action="/my/delete" data-confirm="delete {{ f.name }} ({{ f.code }})? its link stops working. this can't be undone."><input type="hidden" name="code" value="{{ f.code }}"><input type="hidden" name="tab" value="{{ mine.tab }}"><input type="hidden" name="page" value="{{ mine.page }}"><input type="hidden" name="q" value="{{ mine.q }}"><button type="submit">delete</button></form></td>
     </tr>
   {% endfor %}
   </tbody>
 </table></div>
+{% elif mine.q %}<p class="hint">no files match “{{ mine.q }}”</p>
 {% else %}<p class="hint">nothing uploaded yet</p>{% endif %}
 
 {% elif mine.tab == "notes" %}
@@ -166,9 +178,9 @@ h2 .count { font-weight: 400; opacity: 0.6; font-size: 0.9rem; margin-left: 0.25
 
 {% if mine.pages > 1 %}
 <nav class="pager" aria-label="pages">
-  {% if mine.page > 1 %}<a href="/my?tab={{ mine.tab }}&amp;page={{ mine.page - 1 }}">← newer</a>{% else %}<span></span>{% endif %}
+  {% if mine.page > 1 %}<a href="/my?tab={{ mine.tab }}&amp;page={{ mine.page - 1 }}{{ mine.q_param }}">← newer</a>{% else %}<span></span>{% endif %}
   <span class="hint">{{ mine.first }}–{{ mine.last }} of {{ mine.total }}</span>
-  {% if mine.page < mine.pages %}<a href="/my?tab={{ mine.tab }}&amp;page={{ mine.page + 1 }}">older →</a>{% else %}<span></span>{% endif %}
+  {% if mine.page < mine.pages %}<a rel="next" href="/my?tab={{ mine.tab }}&amp;page={{ mine.page + 1 }}{{ mine.q_param }}">older →</a>{% else %}<span></span>{% endif %}
 </nav>
 {% endif %}
 {% endif %}
@@ -187,19 +199,61 @@ if (pw) pw.addEventListener('keydown', function (e) {
 document.getElementById('file').addEventListener('change', function () {
   if (this.files.length) document.getElementById('upload-btn').click();
 });
-// Deletes ask first; the question names what goes.
-document.querySelectorAll('form[data-confirm]').forEach(function (f) {
-  f.addEventListener('submit', function (e) {
-    if (!confirm(f.dataset.confirm)) e.preventDefault();
-  });
+// Deletes ask first; the question names what goes. Listened for on the
+// document, so rows added by scrolling ask too.
+document.addEventListener('submit', function (e) {
+  const f = e.target;
+  if (f.dataset && f.dataset.confirm && !confirm(f.dataset.confirm)) e.preventDefault();
 });
 // Times arrive in UTC; show them in the viewer's own time zone.
 const pad = (n) => String(n).padStart(2, '0');
-document.querySelectorAll('time[datetime]').forEach(function (t) {
-  const d = new Date(t.getAttribute('datetime'));
-  if (isNaN(d)) return;
-  t.textContent = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
-    + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
-});
+function localTimes(root) {
+  root.querySelectorAll('time[datetime]').forEach(function (t) {
+    const d = new Date(t.getAttribute('datetime'));
+    if (isNaN(d)) return;
+    t.textContent = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+      + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  });
+}
+localTimes(document);
+// Infinite scroll on /my: when the pager comes into view, fetch the next page
+// and append its rows here. Without script, the pager works as plain links.
+(function () {
+  const pager = document.querySelector('nav.pager');
+  const tbody = document.querySelector('.scroll tbody');
+  if (!pager || !tbody || !('IntersectionObserver' in window)) return;
+  let busy = false;
+  let done = false;
+  const io = new IntersectionObserver(async function (entries) {
+    const next = pager.querySelector('a[rel=next]');
+    if (busy || !next || !entries.some((en) => en.isIntersecting)) return;
+    busy = true;
+    try {
+      const res = await fetch(next.href, { credentials: 'same-origin' });
+      if (!res.ok) throw new Error('status ' + res.status);
+      const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+      const rows = doc.querySelectorAll('.scroll tbody tr');
+      rows.forEach(function (tr) { localTimes(tr); tbody.append(document.adoptNode(tr)); });
+      const np = doc.querySelector('nav.pager');
+      const nn = np && np.querySelector('a[rel=next]');
+      // Keep the "newer" link (if this page had one); show the new range's end.
+      const first = pager.querySelector('.hint').textContent.split('–')[0];
+      const span = np && np.querySelector('.hint');
+      if (span) pager.querySelector('.hint').textContent = first + '–' + span.textContent.split('–')[1];
+      if (nn) next.href = nn.href;
+      else { next.replaceWith(document.createElement('span')); done = true; }
+      if (!rows.length) done = true;
+    } catch (err) {
+      done = true; // the link still works by hand
+    } finally {
+      busy = false;
+      // Still in view after loading (a tall window, or fast scrolling)? Look
+      // again: observing anew reports the current state straight away.
+      io.unobserve(pager);
+      if (!done) io.observe(pager);
+    }
+  }, { rootMargin: '400px' });
+  io.observe(pager);
+})();
 </script>
 {% endblock %}

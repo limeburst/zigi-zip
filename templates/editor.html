@@ -32,6 +32,8 @@ a.code { text-decoration: none; font-weight: 600; }
   border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
 #files td.name { white-space: normal; word-break: break-all; }
 #files .num { text-align: right; font-variant-numeric: tabular-nums; }
+#files td.act { text-align: right; width: 1%; }
+#files td.act button { padding: 0.1rem 0.4rem; font-size: 0.8rem; }
 #drop {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 0.25rem; min-height: 110px; padding: 1rem; text-align: center; cursor: pointer;
@@ -66,7 +68,7 @@ a.code { text-decoration: none; font-weight: 600; }
   <aside id="files" aria-label="files">
     <div class="head">files (<span id="file-count">0</span>)</div>
     <table id="file-table" hidden>
-      <thead><tr><th>code</th><th>filename</th><th class="num">size</th></tr></thead>
+      <thead><tr><th>code</th><th>filename</th><th class="num">size</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
     <p id="files-empty" class="hint">none yet</p>
@@ -162,7 +164,18 @@ a.code { text-decoration: none; font-weight: 600; }
         const c1 = document.createElement('td'); c1.append(a);
         const c2 = document.createElement('td'); c2.className = 'name'; c2.textContent = f.name;
         const c3 = document.createElement('td'); c3.className = 'num'; c3.textContent = fmtSize(f.size);
-        tr.append(c1, c2, c3);
+        const c4 = document.createElement('td'); c4.className = 'act';
+        // Signed in, the server says which are ours to delete; otherwise a
+        // typed password decides, so offer it on every row.
+        if (!signedIn || f.can_delete) {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = 'delete';
+          b.setAttribute('aria-label', 'delete ' + f.name);
+          b.addEventListener('click', () => deleteFile(f, b));
+          c4.append(b);
+        }
+        tr.append(c1, c2, c3, c4);
         return tr;
       }));
       $('file-count').textContent = data.files.length;
@@ -174,6 +187,26 @@ a.code { text-decoration: none; font-weight: 600; }
     }
   }
   window.zigiFilesRefresh = refresh;
+
+  async function deleteFile(f, btn) {
+    if (!signedIn && !pw.value) { msg.textContent = 'enter your password above to delete files'; pw.focus(); return; }
+    if (!confirm('delete ' + f.name + ' (' + f.code + ')? its link stops working. this can\'t be undone.')) return;
+    const body = new URLSearchParams({ file: f.code });
+    if (pw.value && !signedIn) body.set('password', pw.value);
+    btn.disabled = true;
+    msg.textContent = 'deleting ' + f.name + '…';
+    try {
+      const r = await fetch('/' + code + '/files/delete', { method: 'POST', body });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) { msg.textContent = f.name + ': ' + (data.error || ('error ' + r.status)); return; }
+      msg.textContent = 'deleted ' + f.name;
+    } catch (e) {
+      msg.textContent = f.name + ': could not delete';
+    } finally {
+      btn.disabled = false;
+      refresh(); // a typed password has signed this browser in
+    }
+  }
 
   async function uploadAll(files) {
     const list = Array.from(files || []);

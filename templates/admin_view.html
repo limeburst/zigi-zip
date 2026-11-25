@@ -10,6 +10,9 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 form.inline { display: inline; margin: 0; padding: 0; border: 0; }
 form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
+form.search { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.5rem 0; padding: 0; border: 0; flex-direction: row; }
+form.search input[type=search] { flex: 1 1 16rem; min-width: 0; padding: 0.4rem; font: inherit; border-radius: 0; border: 1px solid color-mix(in srgb, currentColor 40%, transparent); }
+form.search button { padding: 0.4rem 0.8rem; }
 .flash { padding: 0.4rem 0.6rem; border: 1px solid currentColor; margin: 0.5rem 0; }
 {% endblock %}
 {% block body %}
@@ -17,73 +20,42 @@ form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
 <p class="hint">signed in as <strong>{{ admin_label }}</strong></p>
 {% if flash %}<p class="flash">{{ flash }}</p>{% endif %}
 
-<h2>files ({{ files | length }})</h2>
-{% if files %}
+{% import "admin_rows.html" as r %}
+<h2>files ({% if q %}{{ files.total }} of {{ files_total }}{% else %}{{ files.total }}{% endif %})</h2>
+<form class="search" method="post" action="/admin" role="search">
+  <input type="hidden" name="password" value="{{ password }}">
+  <input type="search" name="q" value="{{ q }}" placeholder="search by filename, code or uploader" aria-label="search files">
+  <button type="submit">search</button>
+  {% if q %}<button type="submit" name="q" value="">clear</button>{% endif %}
+</form>
+{% if files.rows %}
 <table>
   <thead><tr><th>code</th><th>filename</th><th>size</th><th>uploaded</th><th>by</th><th></th></tr></thead>
-  <tbody>
-  {% for f in files %}
-    <tr>
-      <td class="mono"><a href="/{{ f.code }}">{{ f.code }}</a></td>
-      <td class="filename">{{ f.original_name }}</td>
-      <td class="num">{{ f.size_bytes }}</td>
-      <td>{{ f.uploaded_at }}</td>
-      <td>{{ f.created_by_label }}</td>
-      <td>
-        <form class="inline" method="post" action="/admin/delete" onsubmit="return confirm('delete {{ f.code }}?')">
-          <input type="hidden" name="password" value="{{ password }}">
-          <input type="hidden" name="code" value="{{ f.code }}">
-          <button type="submit">delete</button>
-        </form>
-      </td>
-    </tr>
+  <tbody data-list="files"{% if files.next %} data-next="{{ files.next }}"{% endif %}>
+  {% for f in files.rows %}{{ r.file_row(f, password, q) }}
   {% endfor %}
   </tbody>
 </table>
+{% elif q %}<p class="hint">no files match “{{ q }}”</p>
 {% else %}<p class="hint">none</p>{% endif %}
 
-<h2>notes ({{ pastes | length }})</h2>
-{% if pastes %}
+<h2>notes ({{ pastes.total }})</h2>
+{% if pastes.rows %}
 <table>
   <thead><tr><th>code</th><th>updated</th><th>by</th><th></th></tr></thead>
-  <tbody>
-  {% for p in pastes %}
-    <tr>
-      <td class="mono"><a href="/{{ p.code }}">{{ p.code }}</a></td>
-      <td>{{ p.updated_at }}</td>
-      <td>{{ p.created_by_label }}</td>
-      <td>
-        <form class="inline" method="post" action="/admin/delete" onsubmit="return confirm('delete {{ p.code }}?')">
-          <input type="hidden" name="password" value="{{ password }}">
-          <input type="hidden" name="code" value="{{ p.code }}">
-          <button type="submit">delete</button>
-        </form>
-      </td>
-    </tr>
+  <tbody data-list="notes"{% if pastes.next %} data-next="{{ pastes.next }}"{% endif %}>
+  {% for p in pastes.rows %}{{ r.note_row(p, password, q) }}
   {% endfor %}
   </tbody>
 </table>
 {% else %}<p class="hint">none</p>{% endif %}
 
-<h2>short links ({{ short_links | length }})</h2>
-{% if short_links %}
+<h2>short links ({{ short_links.total }})</h2>
+{% if short_links.rows %}
 <table>
   <thead><tr><th>code</th><th>destination</th><th>created</th><th>by</th><th></th></tr></thead>
-  <tbody>
-  {% for s in short_links %}
-    <tr>
-      <td class="mono"><a href="/{{ s.code }}">{{ s.code }}</a></td>
-      <td class="filename">{{ s.destination_url }}</td>
-      <td>{{ s.created_at }}</td>
-      <td>{{ s.created_by_label }}</td>
-      <td>
-        <form class="inline" method="post" action="/admin/delete" onsubmit="return confirm('delete {{ s.code }}?')">
-          <input type="hidden" name="password" value="{{ password }}">
-          <input type="hidden" name="code" value="{{ s.code }}">
-          <button type="submit">delete</button>
-        </form>
-      </td>
-    </tr>
+  <tbody data-list="links"{% if short_links.next %} data-next="{{ short_links.next }}"{% endif %}>
+  {% for s in short_links.rows %}{{ r.link_row(s, password, q) }}
   {% endfor %}
   </tbody>
 </table>
@@ -153,4 +125,53 @@ form.inline button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
   <label><input type="checkbox" name="generate" value="1"> generate a two-word password</label>
   <button type="submit">rotate</button>
 </form>
+<script>
+(function () {
+  // The page's password and search, as the search form carries them; the
+  // search as rendered (defaultValue), not whatever is typed in the box since.
+  const search = document.querySelector('form.search');
+  const password = search.elements.password.value;
+  const q = search.elements.q.defaultValue;
+  // Deletes ask first, including on rows loaded while scrolling.
+  document.addEventListener('submit', function (e) {
+    const f = e.target;
+    if (f.dataset && f.dataset.confirm && !confirm(f.dataset.confirm)) e.preventDefault();
+  });
+  // Infinite scroll: each list loads its next rows when its end comes into
+  // view. Without script, the first page of each list is what shows.
+  if (!('IntersectionObserver' in window)) return;
+  document.querySelectorAll('tbody[data-next]').forEach(function (tbody) {
+    const more = document.createElement('p');
+    more.className = 'hint more';
+    more.textContent = 'loading more…';
+    tbody.closest('table').after(more);
+    let busy = false;
+    let done = false;
+    const io = new IntersectionObserver(async function (entries) {
+      if (busy || !entries.some((en) => en.isIntersecting)) return;
+      const next = tbody.dataset.next;
+      if (!next) return;
+      busy = true;
+      try {
+        const body = new URLSearchParams({ password, q, list: tbody.dataset.list, offset: next });
+        const res = await fetch('/admin/more', { method: 'POST', body });
+        const data = await res.json();
+        if (!res.ok) { more.textContent = data.error || ('error ' + res.status); done = true; return; }
+        tbody.insertAdjacentHTML('beforeend', data.html);
+        if (data.next) { tbody.dataset.next = data.next; }
+        else { delete tbody.dataset.next; done = true; more.remove(); }
+      } catch (err) {
+        more.textContent = 'could not load more';
+        done = true;
+      } finally {
+        busy = false;
+        // Still in view after loading? Observing anew looks again at once.
+        io.unobserve(more);
+        if (!done) io.observe(more);
+      }
+    }, { rootMargin: '400px' });
+    io.observe(more);
+  });
+})();
+</script>
 {% endblock %}

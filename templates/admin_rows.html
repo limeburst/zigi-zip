@@ -1,0 +1,31 @@
+{# One row of each admin list: shared by the page and its infinite scroll. #}
+{% macro delete_form(code, password, q="") %}<form class="inline" method="post" action="/admin/delete" data-confirm="delete {{ code }}?">
+          <input type="hidden" name="password" value="{{ password }}">
+          <input type="hidden" name="code" value="{{ code }}">
+          <input type="hidden" name="q" value="{{ q }}">
+          <button type="submit">delete</button>
+        </form>{% endmacro %}
+
+{% macro file_row(f, password, q) %}<tr>
+      <td class="mono"><a href="/{{ f.code }}">{{ f.code }}</a></td>
+      <td class="filename">{{ f.original_name }}</td>
+      <td class="num">{{ f.size_bytes }}</td>
+      <td>{{ f.uploaded_at }}</td>
+      <td>{{ f.created_by_label }}</td>
+      <td>{{ delete_form(f.code, password, q) }}</td>
+    </tr>{% endmacro %}
+
+{% macro note_row(p, password, q) %}<tr>
+      <td class="mono"><a href="/{{ p.code }}">{{ p.code }}</a></td>
+      <td>{{ p.updated_at }}</td>
+      <td>{{ p.created_by_label }}</td>
+      <td>{{ delete_form(p.code, password, q) }}</td>
+    </tr>{% endmacro %}
+
+{% macro link_row(s, password, q) %}<tr>
+      <td class="mono"><a href="/{{ s.code }}">{{ s.code }}</a></td>
+      <td class="filename">{{ s.destination_url }}</td>
+      <td>{{ s.created_at }}</td>
+      <td>{{ s.created_by_label }}</td>
+      <td>{{ delete_form(s.code, password, q) }}</td>
+    </tr>{% endmacro %}

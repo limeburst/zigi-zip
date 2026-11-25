@@ -1,0 +1,2 @@
+{% import "admin_rows.html" as r %}{% for row in rows %}{% if list == "files" %}{{ r.file_row(row, password, q) }}{% elif list == "notes" %}{{ r.note_row(row, password, q) }}{% else %}{{ r.link_row(row, password, q) }}{% endif %}
+{% endfor %}

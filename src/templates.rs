@@ -17,6 +17,16 @@ static ENV: Lazy<Environment<'static>> = Lazy::new(|| {
     )
     .unwrap();
     env.add_template(
+        "admin_rows.html",
+        include_str!("../templates/admin_rows.html"),
+    )
+    .unwrap();
+    env.add_template(
+        "admin_more.html",
+        include_str!("../templates/admin_more.html"),
+    )
+    .unwrap();
+    env.add_template(
         "admin_view.html",
         include_str!("../templates/admin_view.html"),
     )
